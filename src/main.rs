@@ -9,9 +9,46 @@ use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fmt::Error;
+use std::fs::{read, File};
 use std::io::Cursor;
+use std::process;
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+fn get_memory_usage_stats() -> (u64, u64) {
+    let pid = process::id();
+    // Get RSS (Resident Set Size) and VSZ (Virtual Memory Size)
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(&["-o", "rss=,vsz=", "-p", &pid.to_string()])
+        .output()
+    {
+        if let Ok(stats_str) = String::from_utf8(output.stdout) {
+            let stats: Vec<&str> = stats_str.split_whitespace().collect();
+            if stats.len() >= 2 {
+                if let (Ok(rss), Ok(vsz)) = (stats[0].parse::<u64>(), stats[1].parse::<u64>()) {
+                    return (rss * 1024, vsz * 1024); // Convert KB to bytes
+                }
+            }
+        }
+    }
+    (0, 0)
+}
+
+fn print_memory_stats(stage: &str) {
+    let (rss, vsz) = get_memory_usage_stats();
+    println!("\n=== Memory Stats at {} ===", stage);
+    println!(
+        "RSS (Physical Memory): {:.2} MB",
+        rss as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "VSZ (Virtual Memory): {:.2} MB",
+        vsz as f64 / 1024.0 / 1024.0
+    );
+    println!("==============================\n");
+}
 
 fn write_batch_ipc(path: &str, batch: &RecordBatch) -> std::io::Result<()> {
     let file = File::create(path)?;
@@ -23,69 +60,69 @@ fn write_batch_ipc(path: &str, batch: &RecordBatch) -> std::io::Result<()> {
 
 /// Memory-mapped file reader for Arrow IPC format
 /// Uses memory mapping for efficient file reading without loading entire file into memory
-fn read_batches_ipc(path: &str) -> ArrowResult<Vec<RecordBatch>> {
+fn read_batches_ipc(path: &str) -> Result<(), std::io::Error> {
     let file = File::open(path)?;
     // Memory mapping allows us to access file contents without loading it entirely into memory
     let mmap_new = unsafe { Mmap::map(&file)? };
     // Cursor provides Seek trait implementation for the byte slice
-    let cursor = Cursor::new(&mmap_new[..]);
-    let reader = FileReader::try_new(Box::new(cursor), None)?;
-    reader.collect::<ArrowResult<Vec<_>>>()
+    let buf = &mmap_new[..];
+    let cursor = Cursor::new(buf);
+    let reader = FileReader::try_new(Box::new(cursor), None);
+    Ok(())
 }
 
 fn main() {
-    let _ = arrow_array();
-    let _ = array_array_builder();
+    let pid = process::id();
+    println!("\n🚀 Process started with PID: {}", pid);
+    println!("To monitor in real-time, run in another terminal:");
+    println!("  top -pid {}", pid);
+    println!("  # or");
+    println!("  ps -o pid,rss,vsz,command -p {}\n", pid);
 
-    match create_dns_record_batch() {
-        Ok(temp_batch) => {
-            println!("Created record batch with {} rows", temp_batch.num_rows());
-            println!("Number of cols: {}", temp_batch.num_columns());
+    // Print initial memory usage
+    print_memory_stats("Program Start");
 
-            write_batch_ipc("segment.arrow", &temp_batch).unwrap();
+    // Create a large file
+    // let num_rows = 20_000_000; // Adjust this to get desired file size
+    // println!("Creating large record batch with {} rows...", num_rows);
+    // let start_time = Instant::now();
 
-            let read_batches = read_batches_ipc("segment.arrow").unwrap();
-            let batch = &read_batches[0];
+    // let batch = create_large_record_batch(num_rows).unwrap();
+    // println!("Record batch created in {:?}", start_time.elapsed());
+    // print_memory_stats("After Batch Creation");
 
-            let doc_ids = vec![0, 2];
+    // // Write to file
+    // println!("Writing to file...");
+    // let write_start = Instant::now();
+    // write_batch_ipc("large_segment.arrow", &batch).unwrap();
+    // println!("Write completed in {:?}", write_start.elapsed());
 
-            // Works with list of strings (domain names)
-            match get_field_values_by_doc_ids("responseData.answers.domainName", &batch, &doc_ids) {
-                Ok(domain_results) => println!("Domain names: {:?}", domain_results),
-                Err(e) => eprintln!("Error getting domain names: {}", e),
-            }
+    // // Clear batch to free memory
+    // drop(batch);
+    // print_memory_stats("After Batch Drop");
 
-            // Works with boolean values
-            match get_field_values_by_doc_ids("isError", &batch, &doc_ids) {
-                Ok(error_results) => println!("Error flags: {:?}", error_results),
-                Err(e) => eprintln!("Error getting error flags: {}", e),
-            }
+    // Memory map and read
+    // println!("Reading file using mmap...");
+    let read_start = Instant::now();
 
-            // Works with list of integers (time responses)
-            match get_field_values_by_doc_ids("responseData.answers.timeResponse", &batch, &doc_ids)
-            {
-                Ok(time_results) => println!("Time responses: {:?}", time_results),
-                Err(e) => eprintln!("Error getting time responses: {}", e),
-            }
+    let batches = read_batches_ipc("large_segment.arrow").unwrap();
+    println!("Read completed in {:?}", read_start.elapsed());
+    print_memory_stats("After MMAP Read");
 
-            // Calculate numeric stats for time responses
-            match get_numeric_stats_by_doc_ids::<i32>(
-                "responseData.answers.timeResponse",
-                &batch,
-                &doc_ids,
-            ) {
-                Ok(stats) => println!("Time response stats: {:?}", stats),
-                Err(e) => eprintln!("Error calculating time response stats: {}", e),
-            }
+    sleep(Duration::from_millis(10000));
 
-            // Calculate numeric stats for message type ID
-            match get_numeric_stats_by_doc_ids::<i64>("messageTypeId", &batch, &doc_ids) {
-                Ok(stats) => println!("Message type ID stats: {:?}", stats),
-                Err(e) => eprintln!("Error calculating message type ID stats: {}", e),
-            }
-        }
-        Err(e) => eprintln!("Error creating record batch: {}", e),
-    }
+    // Access some data to ensure it works
+    // let first_batch = &batches[0];
+    // println!("Successfully read {} rows", first_batch.num_rows());
+
+    // // Get file size
+    // let file_size = std::fs::metadata("large_segment.arrow").unwrap().len();
+    // println!("\nFile size: {:.2} MB", file_size as f64 / 1024.0 / 1024.0);
+
+    // // Keep the program alive for monitoring if needed
+    // println!("\nPress Enter to exit...");
+    // let mut input = String::new();
+    // std::io::stdin().read_line(&mut input).unwrap();
 }
 
 fn arrow_array() -> Int32Array {
@@ -146,67 +183,51 @@ fn create_dns_schema() -> Schema {
     ])
 }
 
-/// Creates a sample DNS record batch with 3 records demonstrating different scenarios:
-/// 1. Successful query with multiple answers
-/// 2. Successful query with single answer
-/// 3. Failed query with error
-fn create_dns_record_batch() -> ArrowResult<RecordBatch> {
-    // Create the schema
+/// Creates a large record batch with specified number of rows
+fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
     let schema = create_dns_schema();
 
-    // Create builders for our arrays
+    // Create builders with larger capacity
     let mut domain_names_builder = ListBuilder::new(StringBuilder::new());
     let mut rcode_name_builder = StringBuilder::new();
     let mut time_response_builder = ListBuilder::new(Int32Builder::new());
     let mut message_type_builder = Int64Builder::new();
-    let mut timestamp_builder = TimestampMicrosecondArray::builder(0);
-    let mut is_error_builder = BooleanArray::builder(0);
+    let mut timestamp_builder = TimestampMicrosecondArray::builder(num_rows);
+    let mut is_error_builder = BooleanArray::builder(num_rows);
 
-    // Add data for 3 records
-    // Record 1
-    domain_names_builder.values().append_value("example.com");
-    domain_names_builder
-        .values()
-        .append_value("sub.example.com");
-    domain_names_builder.append(true);
+    // Generate large amount of data
+    for i in 0..num_rows {
+        // Add multiple domain names per record to increase size
+        domain_names_builder
+            .values()
+            .append_value(&format!("domain{}.com", i));
+        domain_names_builder
+            .values()
+            .append_value(&format!("sub{}.domain{}.com", i, i));
+        domain_names_builder
+            .values()
+            .append_value(&format!("sub2{}.domain{}.com", i, i));
+        domain_names_builder.append(true);
 
-    rcode_name_builder.append_value("NOERROR");
+        rcode_name_builder.append_value("NOERROR");
 
-    time_response_builder.values().append_value(100);
-    time_response_builder.values().append_value(150);
-    time_response_builder.append(true);
+        // Add multiple time responses
+        time_response_builder
+            .values()
+            .append_value(100 + (i as i32));
+        time_response_builder
+            .values()
+            .append_value(150 + (i as i32));
+        time_response_builder
+            .values()
+            .append_value(200 + (i as i32));
+        time_response_builder.append(true);
 
-    message_type_builder.append_value(1);
-    timestamp_builder.append_value(1234567890000000);
-    is_error_builder.append_value(false);
+        message_type_builder.append_value(i as i64);
+        timestamp_builder.append_value(1234567890000000 + (i as i64));
+        is_error_builder.append_value(i % 5 == 0); // Some errors
+    }
 
-    // Record 2
-    domain_names_builder.values().append_value("test.com");
-    domain_names_builder.append(true);
-
-    rcode_name_builder.append_value("NOERROR");
-
-    time_response_builder.values().append_value(200);
-    time_response_builder.append(true);
-
-    message_type_builder.append_value(1);
-    timestamp_builder.append_value(1234567891000000);
-    is_error_builder.append_value(false);
-
-    // Record 3
-    domain_names_builder.values().append_value("error.com");
-    domain_names_builder.append(true);
-
-    rcode_name_builder.append_value("SERVFAIL");
-
-    time_response_builder.values().append_value(500);
-    time_response_builder.append(true);
-
-    message_type_builder.append_value(2);
-    timestamp_builder.append_value(1234567892000000);
-    is_error_builder.append_value(true);
-
-    // Create arrays from builders
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(domain_names_builder.finish()),
         Arc::new(rcode_name_builder.finish()),
@@ -216,7 +237,6 @@ fn create_dns_record_batch() -> ArrowResult<RecordBatch> {
         Arc::new(is_error_builder.finish()),
     ];
 
-    // Create and return the record batch
     RecordBatch::try_new(Arc::new(schema), arrays)
 }
 
