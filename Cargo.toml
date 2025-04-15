@@ -1,0 +1,9 @@
+[package]
+name = "arrownam"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "55.0.0", features = ["ipc"] }
+memmap2 = "0.9.5"
+num = "0.4"
