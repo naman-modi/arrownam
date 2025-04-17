@@ -1,11 +1,9 @@
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, GenericListArray, Int32Array,
-    Int32Builder, Int64Array, Int64Builder, ListBuilder, StringArray, StringBuilder,
-    TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, GenericListArray, Int32Builder,
+    Int64Builder, ListBuilder, StringArray, StringBuilder, TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema, TimeUnit};
 use arrow::error::{ArrowError, Result as ArrowResult};
-use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::Buffer;
@@ -21,12 +19,118 @@ use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Cursor;
 use std::process;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Structure to hold benchmark metrics for queries
+#[derive(Debug, Clone)]
+pub struct QueryStats {
+    pub query_type: String,
+    pub field_name: String,
+    pub doc_ids_count: usize,
+    pub result_rows: usize,
+    pub setup_time_ms: u128,
+    pub process_time_ms: u128,
+    pub total_time_ms: u128,
+    pub memory_before_mb: f64,
+    pub memory_after_mb: f64,
+    pub memory_impact_mb: f64,
+}
+
+impl QueryStats {
+    pub fn new(query_type: &str, field_name: &str, doc_ids_count: usize) -> Self {
+        let (rss, _vsz) = get_memory_usage_stats();
+        QueryStats {
+            query_type: query_type.to_string(),
+            field_name: field_name.to_string(),
+            doc_ids_count,
+            result_rows: 0,
+            setup_time_ms: 0,
+            process_time_ms: 0,
+            total_time_ms: 0,
+            memory_before_mb: rss as f64 / 1024.0 / 1024.0,
+            memory_after_mb: 0.0,
+            memory_impact_mb: 0.0,
+        }
+    }
+
+    pub fn finish(mut self, result_rows: usize) -> Self {
+        let (rss, _vsz) = get_memory_usage_stats();
+        self.result_rows = result_rows;
+        self.memory_after_mb = rss as f64 / 1024.0 / 1024.0;
+        self.memory_impact_mb = self.memory_after_mb - self.memory_before_mb;
+        self
+    }
+
+    pub fn add_timing(&mut self, setup_time: Duration, process_time: Duration) {
+        self.setup_time_ms = setup_time.as_millis();
+        self.process_time_ms = process_time.as_millis();
+        self.total_time_ms = setup_time.as_millis() + process_time.as_millis();
+    }
+
+    pub fn print_benchmark(&self) {
+        println!("\n=== Query Performance Metrics ===");
+        println!("Query Type: {}", self.query_type);
+        println!("Field Name: {}", self.field_name);
+        println!("Doc IDs Count: {}", self.doc_ids_count);
+        println!("Result Rows: {}", self.result_rows);
+        println!("Setup Time: {:.2} ms", self.setup_time_ms);
+        println!("Process Time: {:.2} ms", self.process_time_ms);
+        println!(
+            "Total Time: {:.2} ms ({:.2} s)",
+            self.total_time_ms,
+            self.total_time_ms as f64 / 1000.0
+        );
+        println!("Memory Before: {:.2} MB", self.memory_before_mb);
+        println!("Memory After: {:.2} MB", self.memory_after_mb);
+        println!("Memory Impact: {:.2} MB", self.memory_impact_mb);
+        println!("===============================");
+    }
+}
+
+/// Measure setup and processing time for a query
+pub fn measure_query_timing<T, F1, F2>(setup_fn: F1, process_fn: F2) -> (T, Duration, Duration)
+where
+    F1: FnOnce() -> T,
+    F2: FnOnce(T) -> T,
+{
+    // Measure setup time
+    let setup_start = Instant::now();
+    let result = setup_fn();
+    let setup_time = setup_start.elapsed();
+
+    // Measure processing time
+    let process_start = Instant::now();
+    let processed_result = process_fn(result);
+    let process_time = process_start.elapsed();
+
+    (processed_result, setup_time, process_time)
+}
+
+/// Print a benchmark summary table from multiple query stats
+pub fn print_benchmark_table(all_stats: &[QueryStats]) {
+    println!("\n======================= ARROW BENCHMARK SUMMARY =======================");
+    println!(
+        "| {:<30} | {:<20} | {:<8} | {:<11} | {:<10} | {:<13} |",
+        "Query Type", "Field", "Doc IDs", "Result Rows", "Total Time", "Memory Impact"
+    );
+    println!("|--------------------------------|----------------------|----------|-------------|------------|---------------|");
+
+    for stat in all_stats {
+        println!(
+            "| {:<30} | {:<20} | {:<8} | {:<11} | {:<8.2}s | {:<13.2} |",
+            stat.query_type,
+            stat.field_name,
+            stat.doc_ids_count,
+            stat.result_rows,
+            stat.total_time_ms as f64 / 1000.0,
+            stat.memory_impact_mb
+        );
+    }
+    println!("=====================================================================");
+}
 
 /// Incrementally decodes RecordBatches from an IPC file stored in an Arrow
 /// Buffer using the FileDecoder API.
@@ -399,142 +503,6 @@ fn generate_random_json(i: usize) -> Value {
     })
 }
 
-/// Retrieves field values by document IDs from an Arrow IPC file using a memory-efficient approach
-/// This implementation is more memory efficient as it processes only the needed documents
-fn get_field_values_by_doc_ids(
-    field_name: &str,
-    doc_ids: &[usize],
-    file_path: &str,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
-    let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::new();
-
-    sleep(Duration::from_secs(5));
-
-    // Open the file and memory map it
-    let file = File::open(file_path)
-        .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to open file: {}", e)))?;
-
-    // Get file metadata to calculate chunk sizes and offsets
-    let file_size = file
-        .metadata()
-        .map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to get file metadata: {}", e))
-        })?
-        .len();
-
-    println!("File size: {} bytes", file_size);
-
-    // Sort and deduplicate document IDs for efficient processing
-    let mut sorted_doc_ids = doc_ids.to_vec();
-    sorted_doc_ids.sort_unstable();
-    sorted_doc_ids.dedup();
-
-    // Track which document IDs we've processed
-    let mut processed_ids = vec![false; sorted_doc_ids.len()];
-    let mut processed_doc_ids = 0;
-
-    // Process each batch
-    let mut batch_count = 0;
-    let mut total_rows = 0;
-
-    // Memory mapping allows us to access file contents without loading entire file into memory
-    let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
-        })?
-    };
-
-    // Keep the mmap alive for the duration of the function
-    let _buf = &mmap[..];
-    let cursor = Cursor::new(_buf);
-    let reader = FileReader::try_new(Box::new(cursor), None)?;
-
-    // Get the schema to find the field index
-    let schema = reader.schema();
-    let field_index = schema.index_of(field_name).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-    })?;
-
-    for batch_result in reader {
-        match batch_result {
-            Ok(batch) => {
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                total_rows += batch_rows;
-
-                // Create a filter bitset to identify which rows in this batch we need
-                let mut filter = vec![false; batch_rows];
-                let mut has_docs_in_batch = false;
-
-                // Find which document IDs are in this batch
-                let mut batch_doc_ids = Vec::new();
-                let mut batch_indices = Vec::new();
-
-                for (i, &doc_id) in sorted_doc_ids.iter().enumerate() {
-                    if !processed_ids[i] && doc_id < batch_rows {
-                        filter[doc_id] = true;
-                        batch_doc_ids.push(doc_id);
-                        batch_indices.push(i);
-                        processed_ids[i] = true;
-                        processed_doc_ids += 1;
-                        has_docs_in_batch = true;
-                    }
-                }
-
-                // If we found any document IDs in this batch, process them
-                if has_docs_in_batch {
-                    // Extract only the column we need and clone it
-                    let column = batch.columns()[field_index].clone();
-                    // Drop the full batch to free memory
-                    drop(batch);
-
-                    // Process based on the data type
-                    if let DataType::List(_) = column.data_type() {
-                        process_list_array_batch_with_filter(
-                            &column,
-                            &filter,
-                            &batch_doc_ids,
-                            &batch_indices,
-                            &sorted_doc_ids,
-                            &mut value_to_doc_ids,
-                        )?;
-                    } else {
-                        process_scalar_array_batch_with_filter(
-                            &column,
-                            &filter,
-                            &batch_doc_ids,
-                            &batch_indices,
-                            &sorted_doc_ids,
-                            &mut value_to_doc_ids,
-                        )?;
-                    }
-                }
-
-                // If we've processed all document IDs, we can stop
-                if processed_doc_ids == sorted_doc_ids.len() {
-                    println!("All document IDs processed after {} batches", batch_count);
-                    break;
-                }
-            }
-            Err(e) => eprintln!("Error reading batch {}: {}", batch_count, e),
-        }
-    }
-
-    sleep(Duration::from_secs(5));
-
-    println!(
-        "Processed {} batches with {} total rows",
-        batch_count, total_rows
-    );
-    println!(
-        "Processed {} out of {} document IDs",
-        processed_doc_ids,
-        sorted_doc_ids.len()
-    );
-
-    Ok(value_to_doc_ids)
-}
-
 /// Process a batch of list array values for specific document IDs using a filter bitset
 fn process_list_array_batch_with_filter(
     array: &ArrayRef,
@@ -690,547 +658,21 @@ fn process_scalar_array_batch_with_filter(
     Ok(())
 }
 
-/// Retrieves field values for all documents in an Arrow IPC file using a memory-efficient approach
-/// This implementation processes all documents in the file with minimal memory usage
-fn get_all_field_values(
-    field_name: &str,
-    file_path: &str,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
-    // Reserve a large initial capacity for the HashMap to avoid frequent resizing
-
-    let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::with_capacity(1_000_000);
-
-    // Open the file and memory map it
-    let file = File::open(file_path)
-        .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to open file: {}", e)))?;
-
-    // Get file metadata
-    let file_size = file
-        .metadata()
-        .map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to get file metadata: {}", e))
-        })?
-        .len();
-
-    println!("File size: {} bytes", file_size);
-
-    // Memory mapping allows us to access file contents without loading entire file into memory
-    let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
-        })?
-    };
-
-    // Keep the mmap alive for the duration of the function
-    let _buf = &mmap[..];
-    let cursor = Cursor::new(_buf);
-    let reader = FileReader::try_new(Box::new(cursor), None)?;
-
-    // Get the schema to find the field index
-    let schema = reader.schema();
-    let field_index = schema.index_of(field_name).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-    })?;
-
-    // Process batches
-    let mut batch_count = 0;
-    let mut total_rows = 0;
-    let mut processed_rows = 0;
-    let mut strings_seen = 0;
-    let chunk_size = 1_000_000; // Process in chunks of 1 million rows
-
-    // Process batches one at a time to minimize memory usage
-    for batch_result in reader {
-        match batch_result {
-            Ok(batch) => {
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                total_rows += batch_rows;
-
-                // Extract only the column we need and clone it
-                let column = &batch.columns()[field_index];
-
-                // Process the column for all rows
-                let new_strings =
-                    process_column_for_all_rows(column, processed_rows, &mut value_to_doc_ids)?;
-                strings_seen += new_strings;
-
-                // Update the processed row count
-                processed_rows += batch_rows;
-
-                drop(batch)
-            }
-            Err(e) => eprintln!("Error reading batch {}: {}", batch_count, e),
-        }
-    }
-
-    println!(
-        "Processed {} batches with {} total rows",
-        batch_count, total_rows
-    );
-    println!("Found {} total string values", strings_seen);
-    println!("Resulting in {} unique values", value_to_doc_ids.len());
-
-    Ok(value_to_doc_ids)
-}
-
-/// Process a column for all rows
-/// Returns the number of string values processed
-fn process_column_for_all_rows(
-    array: &ArrayRef,
-    row_offset: usize,
-    value_to_doc_ids: &mut HashMap<String, Vec<usize>>,
-) -> Result<usize, ArrowError> {
-    let mut strings_processed = 0;
-
-    match array.data_type() {
-        DataType::List(field) => {
-            match field.data_type() {
-                DataType::Utf8 => {
-                    let list_array: &GenericListArray<i32> =
-                        array.as_any().downcast_ref().ok_or_else(|| {
-                            ArrowError::InvalidArgumentError(
-                                "Failed to downcast to list array".to_string(),
-                            )
-                        })?;
-
-                    // Process all rows in the list array
-                    for doc_id in 0..list_array.len() {
-                        let global_doc_id = row_offset + doc_id;
-
-                        if !list_array.is_null(doc_id) {
-                            let values = list_array.value(doc_id);
-                            let string_array = values
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .ok_or_else(|| {
-                                    ArrowError::InvalidArgumentError(
-                                        "Failed to downcast to string array".to_string(),
-                                    )
-                                })?;
-
-                            for j in 0..string_array.len() {
-                                if !string_array.is_null(j) {
-                                    let value = string_array.value(j).to_string();
-                                    strings_processed += 1;
-
-                                    // Use entry API to avoid duplicate lookups
-                                    value_to_doc_ids
-                                        .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
-                                        .push(global_doc_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                DataType::Int32 => {
-                    let list_array: &GenericListArray<i32> =
-                        array.as_any().downcast_ref().ok_or_else(|| {
-                            ArrowError::InvalidArgumentError(
-                                "Failed to downcast to list array".to_string(),
-                            )
-                        })?;
-
-                    // Process all rows in the list array
-                    for doc_id in 0..list_array.len() {
-                        let global_doc_id = row_offset + doc_id;
-
-                        if !list_array.is_null(doc_id) {
-                            let values = list_array.value(doc_id);
-                            let int_array = values.as_primitive::<Int32Type>();
-
-                            for j in 0..int_array.len() {
-                                if !int_array.is_null(j) {
-                                    let value = int_array.value(j).to_string();
-                                    strings_processed += 1;
-
-                                    value_to_doc_ids
-                                        .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
-                                        .push(global_doc_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // For other types, use the generic approach
-                    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i32>>()
-                    {
-                        for doc_id in 0..list_array.len() {
-                            let global_doc_id = row_offset + doc_id;
-
-                            if !list_array.is_null(doc_id) {
-                                let values = list_array.value(doc_id);
-                                let len = values.len();
-
-                                for j in 0..len {
-                                    if !values.is_null(j) {
-                                        let value = format!("{:?}", values.as_any());
-                                        strings_processed += 1;
-
-                                        value_to_doc_ids
-                                            .entry(value)
-                                            .or_insert_with(|| Vec::with_capacity(8))
-                                            .push(global_doc_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {
-            // For scalar arrays (non-list)
-            let num_rows = array.len();
-
-            for doc_id in 0..num_rows {
-                let global_doc_id = row_offset + doc_id;
-
-                if !array.is_null(doc_id) {
-                    let value = match array.data_type() {
-                        DataType::Utf8 => {
-                            let string_array =
-                                array.as_any().downcast_ref::<StringArray>().unwrap();
-                            string_array.value(doc_id).to_string()
-                        }
-                        DataType::Boolean => {
-                            let bool_array = array.as_boolean();
-                            bool_array.value(doc_id).to_string()
-                        }
-                        DataType::Int32 => {
-                            let int_array = array.as_primitive::<Int32Type>();
-                            int_array.value(doc_id).to_string()
-                        }
-                        DataType::Int64 => {
-                            let int_array = array.as_primitive::<Int64Type>();
-                            int_array.value(doc_id).to_string()
-                        }
-                        _ => format!("{:?}", array.as_any()),
-                    };
-
-                    strings_processed += 1;
-
-                    value_to_doc_ids
-                        .entry(value)
-                        .or_insert_with(|| Vec::with_capacity(8))
-                        .push(global_doc_id);
-                }
-            }
-        }
-    }
-
-    Ok(strings_processed)
-}
-
-/// Retrieves field values for a range of rows in an Arrow IPC file using a memory-efficient approach
-/// This allows scanning only a subset of documents which is useful for very large datasets
-fn get_field_values_by_row_range(
-    field_name: &str,
-    file_path: &str,
-    start_row: usize,
-    end_row: Option<usize>,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
-    // Reserve a reasonable initial capacity for the HashMap
-    let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::with_capacity(100_000);
-
-    // Open the file and memory map it
-    let file = File::open(file_path)
-        .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to open file: {}", e)))?;
-
-    // Get file metadata
-    let file_size = file
-        .metadata()
-        .map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to get file metadata: {}", e))
-        })?
-        .len();
-
-    println!("File size: {} bytes", file_size);
-
-    // Memory mapping allows us to access file contents without loading entire file into memory
-    let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
-        })?
-    };
-
-    // Keep the mmap alive for the duration of the function
-    let _buf = &mmap[..];
-    let cursor = Cursor::new(_buf);
-    let reader = FileReader::try_new(Box::new(cursor), None)?;
-
-    // Get the schema to find the field index
-    let schema = reader.schema();
-    let field_index = schema.index_of(field_name).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-    })?;
-
-    // Process batches
-    let mut batch_count = 0;
-    let mut total_rows = 0;
-    let mut processed_rows = 0;
-    let mut strings_seen = 0;
-    let mut current_row = 0;
-
-    // Process batches one at a time to minimize memory usage
-    for batch_result in reader {
-        match batch_result {
-            Ok(batch) => {
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                total_rows += batch_rows;
-
-                // Skip batches before start_row
-                if current_row + batch_rows <= start_row {
-                    current_row += batch_rows;
-                    continue;
-                }
-
-                // Stop if we've gone past end_row
-                if let Some(end) = end_row {
-                    if current_row >= end {
-                        break;
-                    }
-                }
-
-                // Calculate the effective batch start and end
-                let batch_start = start_row.saturating_sub(current_row);
-
-                let batch_end = if let Some(end) = end_row {
-                    if current_row + batch_rows > end {
-                        end - current_row
-                    } else {
-                        batch_rows
-                    }
-                } else {
-                    batch_rows
-                };
-
-                if batch_start >= batch_end {
-                    current_row += batch_rows;
-                    continue;
-                }
-
-                // Extract only the column we need and clone it
-                let column = &batch.columns()[field_index];
-                // Drop the full batch to free memory
-
-                // Process the range within the column
-                let new_strings = process_column_row_range(
-                    column,
-                    current_row + batch_start,
-                    batch_start,
-                    batch_end,
-                    &mut value_to_doc_ids,
-                )?;
-
-                strings_seen += new_strings;
-                processed_rows += batch_end - batch_start;
-
-                drop(batch);
-
-                // // Log progress periodically
-                // if batch_count % 10 == 0 {
-                //     println!(
-                //         "Processed {} batches, {} rows, {} unique values so far",
-                //         batch_count,
-                //         processed_rows,
-                //         value_to_doc_ids.len()
-                //     );
-                //     print_memory_stats(&format!("After processing {} batches", batch_count));
-                // }
-
-                current_row += batch_rows;
-
-                // Stop if we've reached the end_row
-                if let Some(end) = end_row {
-                    if current_row >= end {
-                        break;
-                    }
-                }
-            }
-            Err(e) => eprintln!("Error reading batch {}: {}", batch_count, e),
-        }
-    }
-
-    println!(
-        "Processed {} batches with {} total rows in range [{}, {})",
-        batch_count,
-        processed_rows,
-        start_row,
-        end_row.unwrap_or(total_rows)
-    );
-    println!("Found {} total string values", strings_seen);
-    println!("Resulting in {} unique values", value_to_doc_ids.len());
-
-    Ok(value_to_doc_ids)
-}
-
-/// Process a column for a range of rows
-/// Returns the number of string values processed
-fn process_column_row_range(
-    array: &ArrayRef,
-    global_row_offset: usize,
-    start_row: usize,
-    end_row: usize,
-    value_to_doc_ids: &mut HashMap<String, Vec<usize>>,
-) -> Result<usize, ArrowError> {
-    let mut strings_processed = 0;
-
-    match array.data_type() {
-        DataType::List(field) => {
-            match field.data_type() {
-                DataType::Utf8 => {
-                    let list_array: &GenericListArray<i32> =
-                        array.as_any().downcast_ref().ok_or_else(|| {
-                            ArrowError::InvalidArgumentError(
-                                "Failed to downcast to list array".to_string(),
-                            )
-                        })?;
-
-                    // Process rows in the specified range
-                    for row_idx in start_row..end_row {
-                        let global_doc_id = global_row_offset + (row_idx - start_row);
-
-                        if !list_array.is_null(row_idx) {
-                            let values = list_array.value(row_idx);
-                            let string_array = values
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .ok_or_else(|| {
-                                    ArrowError::InvalidArgumentError(
-                                        "Failed to downcast to string array".to_string(),
-                                    )
-                                })?;
-
-                            for j in 0..string_array.len() {
-                                if !string_array.is_null(j) {
-                                    let value = string_array.value(j).to_string();
-                                    strings_processed += 1;
-
-                                    // Use entry API to avoid duplicate lookups
-                                    value_to_doc_ids
-                                        .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
-                                        .push(global_doc_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                DataType::Int32 => {
-                    let list_array: &GenericListArray<i32> =
-                        array.as_any().downcast_ref().ok_or_else(|| {
-                            ArrowError::InvalidArgumentError(
-                                "Failed to downcast to list array".to_string(),
-                            )
-                        })?;
-
-                    // Process rows in the specified range
-                    for row_idx in start_row..end_row {
-                        let global_doc_id = global_row_offset + (row_idx - start_row);
-
-                        if !list_array.is_null(row_idx) {
-                            let values = list_array.value(row_idx);
-                            let int_array = values.as_primitive::<Int32Type>();
-
-                            for j in 0..int_array.len() {
-                                if !int_array.is_null(j) {
-                                    let value = int_array.value(j).to_string();
-                                    strings_processed += 1;
-
-                                    value_to_doc_ids
-                                        .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
-                                        .push(global_doc_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // For other types, use the generic approach
-                    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i32>>()
-                    {
-                        for row_idx in start_row..end_row {
-                            let global_doc_id = global_row_offset + (row_idx - start_row);
-
-                            if !list_array.is_null(row_idx) {
-                                let values = list_array.value(row_idx);
-                                let len = values.len();
-
-                                for j in 0..len {
-                                    if !values.is_null(j) {
-                                        let value = format!("{:?}", values.as_any());
-                                        strings_processed += 1;
-
-                                        value_to_doc_ids
-                                            .entry(value)
-                                            .or_insert_with(|| Vec::with_capacity(8))
-                                            .push(global_doc_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {
-            // For scalar arrays (non-list)
-            let num_rows = array.len();
-
-            for row_idx in start_row..std::cmp::min(end_row, num_rows) {
-                let global_doc_id = global_row_offset + (row_idx - start_row);
-
-                if !array.is_null(row_idx) {
-                    let value = match array.data_type() {
-                        DataType::Utf8 => {
-                            let string_array =
-                                array.as_any().downcast_ref::<StringArray>().unwrap();
-                            string_array.value(row_idx).to_string()
-                        }
-                        DataType::Boolean => {
-                            let bool_array = array.as_boolean();
-                            bool_array.value(row_idx).to_string()
-                        }
-                        DataType::Int32 => {
-                            let int_array = array.as_primitive::<Int32Type>();
-                            int_array.value(row_idx).to_string()
-                        }
-                        DataType::Int64 => {
-                            let int_array = array.as_primitive::<Int64Type>();
-                            int_array.value(row_idx).to_string()
-                        }
-                        _ => format!("{:?}", array.as_any()),
-                    };
-
-                    strings_processed += 1;
-
-                    value_to_doc_ids
-                        .entry(value)
-                        .or_insert_with(|| Vec::with_capacity(8))
-                        .push(global_doc_id);
-                }
-            }
-        }
-    }
-
-    Ok(strings_processed)
-}
-
 /// Retrieves field values for all documents in an Arrow IPC file using zero-copy approach
 /// This implementation processes all documents in the file with minimal memory usage
 /// by using the FileDecoder API with memory-mapped files
 fn get_field_values_zero_copy(
     field_name: &str,
     file_path: &str,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
+) -> Result<(HashMap<String, Vec<usize>>, QueryStats), ArrowError> {
+    // Create stats object
+    let mut stats = QueryStats::new("get_field_values_zero_copy", field_name, 0);
+
     // Reserve a large initial capacity for the HashMap to avoid frequent resizing
     let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::with_capacity(1_000_000);
+
+    // Measure setup time
+    let setup_start = Instant::now();
 
     // Open the file and memory map it
     let file = File::open(file_path)
@@ -1263,11 +705,10 @@ fn get_field_values_zero_copy(
     let decoder = IPCBufferDecoder::new(buffer);
     println!("Number of batches in file: {}", decoder.num_batches());
 
-    let mut batch_count = 0;
-    let mut total_rows = 0;
-    let mut processed_rows = 0;
-    let mut strings_seen = 0;
-    let mut current_row = 0;
+    let setup_time = setup_start.elapsed();
+
+    // Measure processing time
+    let process_start = Instant::now();
 
     // We need to get the first batch to access its schema
     if let Ok(Some(first_batch)) = decoder.get_batch(0) {
@@ -1276,7 +717,12 @@ fn get_field_values_zero_copy(
             ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
         })?;
 
-        // Process batches one at a time
+        // Process batches
+        let mut batch_count = 0;
+        let mut total_rows = 0;
+        let mut strings_seen = 0;
+
+        // Process all batches one by one
         for batch_idx in 0..decoder.num_batches() {
             match decoder.get_batch(batch_idx) {
                 Ok(Some(batch)) => {
@@ -1318,13 +764,20 @@ fn get_field_values_zero_copy(
         );
         println!("Found {} total string values", strings_seen);
         println!("Resulting in {} unique values", value_to_doc_ids.len());
-    } else {
-        return Err(ArrowError::InvalidArgumentError(
-            "Failed to read the first batch to get schema".to_string(),
-        ));
-    }
 
-    Ok(value_to_doc_ids)
+        let process_time = process_start.elapsed();
+
+        // Update stats
+        stats.add_timing(setup_time, process_time);
+        stats = stats.finish(value_to_doc_ids.len());
+        stats.print_benchmark();
+
+        Ok((value_to_doc_ids, stats))
+    } else {
+        Err(ArrowError::InvalidArgumentError(
+            "Failed to read the first batch to get schema".to_string(),
+        ))
+    }
 }
 
 /// Retrieves field values by specific document IDs using zero-copy IPC
@@ -1332,8 +785,18 @@ fn get_field_values_by_doc_ids_zero_copy(
     field_name: &str,
     doc_ids: &[usize],
     file_path: &str,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
+) -> Result<(HashMap<String, Vec<usize>>, QueryStats), ArrowError> {
+    // Create stats object
+    let mut stats = QueryStats::new(
+        "get_field_values_by_doc_ids_zero_copy",
+        field_name,
+        doc_ids.len(),
+    );
+
     let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::new();
+
+    // Measure setup time
+    let setup_start = Instant::now();
 
     // Open the file and memory map it
     let file = File::open(file_path)
@@ -1366,6 +829,11 @@ fn get_field_values_by_doc_ids_zero_copy(
     let mut row_offset = 0;
     let mut batch_count = 0;
 
+    let setup_time = setup_start.elapsed();
+
+    // Processing phase - measure time
+    let process_start = Instant::now();
+
     // We need to get the first batch to access its schema
     if let Ok(Some(first_batch)) = decoder.get_batch(0) {
         let schema = first_batch.schema();
@@ -1380,47 +848,57 @@ fn get_field_values_by_doc_ids_zero_copy(
                     batch_count += 1;
                     let batch_rows = batch.num_rows();
 
-                    // Create a filter bitset to identify which rows in this batch we need
-                    let mut filter = vec![false; batch_rows];
-                    let mut has_docs_in_batch = false;
-                    let mut batch_doc_ids = Vec::new();
-                    let mut batch_indices = Vec::new();
-
                     // Find which document IDs are in this batch
+                    let mut batch_doc_ids = Vec::new();
+                    let batch_indices = Vec::new();
+
                     for (i, &doc_id) in sorted_doc_ids.iter().enumerate() {
                         let effective_doc_id = doc_id.saturating_sub(row_offset);
                         if !processed_ids[i]
                             && doc_id >= row_offset
                             && effective_doc_id < batch_rows
                         {
-                            filter[effective_doc_id] = true;
-                            batch_doc_ids.push(effective_doc_id);
-                            batch_indices.push(i);
+                            batch_doc_ids.push((i, effective_doc_id, doc_id));
                             processed_ids[i] = true;
                             processed_doc_ids += 1;
-                            has_docs_in_batch = true;
                         }
                     }
 
                     // If we found any document IDs in this batch, process them
-                    if has_docs_in_batch {
+                    if !batch_doc_ids.is_empty() {
                         let column = batch.column(field_index).clone();
 
                         // Process based on the data type
                         if let DataType::List(_) = column.data_type() {
+                            let mut filter = vec![false; batch_rows];
+                            for &doc_id in &batch_doc_ids {
+                                filter[doc_id.1] = true;
+                            }
+
                             process_list_array_batch_with_filter(
                                 &column,
                                 &filter,
-                                &batch_doc_ids,
+                                &batch_doc_ids
+                                    .iter()
+                                    .map(|&(_, _, doc_id)| doc_id)
+                                    .collect::<Vec<_>>(),
                                 &batch_indices,
                                 &sorted_doc_ids,
                                 &mut value_to_doc_ids,
                             )?;
                         } else {
+                            let mut filter = vec![false; batch_rows];
+                            for &doc_id in &batch_doc_ids {
+                                filter[doc_id.1] = true;
+                            }
+
                             process_scalar_array_batch_with_filter(
                                 &column,
                                 &filter,
-                                &batch_doc_ids,
+                                &batch_doc_ids
+                                    .iter()
+                                    .map(|&(_, _, doc_id)| doc_id)
+                                    .collect::<Vec<_>>(),
                                 &batch_indices,
                                 &sorted_doc_ids,
                                 &mut value_to_doc_ids,
@@ -1454,130 +932,20 @@ fn get_field_values_by_doc_ids_zero_copy(
             processed_doc_ids,
             sorted_doc_ids.len()
         );
+
+        let process_time = process_start.elapsed();
+
+        // Update stats
+        stats.add_timing(setup_time, process_time);
+        stats = stats.finish(value_to_doc_ids.len());
+        stats.print_benchmark();
+
+        Ok((value_to_doc_ids, stats))
     } else {
-        return Err(ArrowError::InvalidArgumentError(
+        Err(ArrowError::InvalidArgumentError(
             "Failed to read the first batch to get schema".to_string(),
-        ));
+        ))
     }
-
-    Ok(value_to_doc_ids)
-}
-
-/// Retrieves field values for a range of rows using zero-copy IPC
-fn get_field_values_by_row_range_zero_copy(
-    field_name: &str,
-    file_path: &str,
-    start_row: usize,
-    end_row: Option<usize>,
-) -> Result<HashMap<String, Vec<usize>>, ArrowError> {
-    // Reserve a reasonable initial capacity for the HashMap
-    let mut value_to_doc_ids: HashMap<String, Vec<usize>> = HashMap::with_capacity(100_000);
-
-    // Open the file and memory map it
-    let file = File::open(file_path)
-        .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to open file: {}", e)))?;
-
-    // Memory mapping allows us to access file contents without loading entire file into memory
-    let mmap = unsafe {
-        Mmap::map(&file).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
-        })?
-    };
-
-    // Keep the mmap alive for the duration of the function
-    let _buf = &mmap[..];
-    let cursor = Cursor::new(_buf);
-    let reader = FileReader::try_new(Box::new(cursor), None)?;
-
-    // Get the schema to find the field index
-    let schema = reader.schema();
-    let field_index = schema.index_of(field_name).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-    })?;
-
-    // Process batches
-    let mut batch_count = 0;
-    let mut total_rows = 0;
-    let mut processed_rows = 0;
-    let mut strings_seen = 0;
-    let mut current_row = 0;
-
-    // Process batches one at a time
-    for batch_result in reader {
-        match batch_result {
-            Ok(batch) => {
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                total_rows += batch_rows;
-
-                // Skip batches before start_row
-                if current_row + batch_rows <= start_row {
-                    current_row += batch_rows;
-                    continue;
-                }
-
-                // Stop if we've gone past end_row
-                if let Some(end) = end_row {
-                    if current_row >= end {
-                        break;
-                    }
-                }
-
-                // Calculate the effective batch start and end
-                let batch_start = start_row.saturating_sub(current_row);
-                let batch_end = if let Some(end) = end_row {
-                    if current_row + batch_rows > end {
-                        end - current_row
-                    } else {
-                        batch_rows
-                    }
-                } else {
-                    batch_rows
-                };
-
-                if batch_start >= batch_end {
-                    current_row += batch_rows;
-                    continue;
-                }
-
-                // Get the column we're interested in
-                let column = batch.column(field_index);
-
-                // Process the range within the column
-                let new_strings = process_column_row_range(
-                    column,
-                    current_row + batch_start,
-                    batch_start,
-                    batch_end,
-                    &mut value_to_doc_ids,
-                )?;
-
-                strings_seen += new_strings;
-                processed_rows += batch_end - batch_start;
-                current_row += batch_rows;
-
-                // Stop if we've reached the end_row
-                if let Some(end) = end_row {
-                    if current_row >= end {
-                        break;
-                    }
-                }
-            }
-            Err(e) => eprintln!("Error reading batch {}: {}", batch_count, e),
-        }
-    }
-
-    println!(
-        "Processed {} batches with {} total rows in range [{}, {})",
-        batch_count,
-        processed_rows,
-        start_row,
-        end_row.unwrap_or(total_rows)
-    );
-    println!("Found {} total string values", strings_seen);
-    println!("Resulting in {} unique values", value_to_doc_ids.len());
-
-    Ok(value_to_doc_ids)
 }
 
 /// Print a sample batch to verify schema
@@ -1675,7 +1043,7 @@ fn print_sample_batch() {
                         println!("null");
                     }
                 }
-                println!("");
+                println!();
             }
         }
         Err(e) => eprintln!("Error creating sample batch: {}", e),
@@ -1696,6 +1064,9 @@ fn main() {
 
     // Print initial memory usage
     print_memory_stats("Program Start");
+
+    // Collect benchmark stats
+    let mut all_benchmark_stats: Vec<QueryStats> = Vec::new();
 
     // Ask if user wants to see a sample batch
     println!("\nDo you want to see a sample batch? (y/n)");
@@ -1820,394 +1191,203 @@ fn main() {
     println!("Processing field: {}", field_name);
 
     // Ask the user which test to run
-    println!("\nSelect a test to run:");
-    println!("1. Process specific document IDs (efficient for sparse queries)");
-    println!("2. Process all documents (efficient for full scans)");
-    println!("3. Process a range of rows (efficient for partitioned processing)");
-    println!("4. Process all documents with zero-copy IPC (most memory efficient)");
-    println!("5. Process specific document IDs with zero-copy IPC");
-    println!("6. Process a range of rows with zero-copy IPC");
-    println!("7. Calculate numeric statistics with zero-copy IPC");
+    println!("\nSelect a test to run (1-7) or 'all' to run all tests:");
+    println!("1. Process all documents with zero-copy IPC (most memory efficient)");
+    println!("2. Process specific document IDs with zero-copy IPC");
+    println!("3. Calculate numeric statistics with zero-copy IPC");
 
     let mut choice = String::new();
     std::io::stdin().read_line(&mut choice).unwrap();
     let choice = choice.trim();
 
-    match choice {
-        "1" => {
-            // Generate random document IDs
-            let mut rng = thread_rng();
-            let total_docs = num_rows; // Total number of documents to select from
-            let num_docs = 100; // Number of documents to process (increased for better measurement)
-            let mut doc_ids: Vec<usize> = (0..total_docs).collect();
-            doc_ids.shuffle(&mut rng);
-            let doc_ids = doc_ids[..num_docs].to_vec();
-
-            println!(
-                "Selected {} random documents from a pool of {}",
-                num_docs, total_docs
-            );
-
-            // Process the field using the memory-optimized approach for specific doc_ids
-            println!("\n=== Memory-Optimized Processing (Specific Document IDs) ===");
-            print_memory_stats("Before processing");
-
-            let start = Instant::now();
-            match get_field_values_by_doc_ids(field_name, &doc_ids, arrow_file_path) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("Field processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
-
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!("  {} -> documents: {:?}", value, ids);
-                    }
-
-                    // Calculate ops per second (documents processed)
-                    let docs_per_second = num_docs as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} documents/second", docs_per_second);
-                }
-                Err(e) => eprintln!("Error processing field: {}", e),
-            }
-
-            print_memory_stats("After processing");
+    let tests_to_run = if choice.to_lowercase() == "all" {
+        (1..=3).collect::<Vec<_>>()
+    } else if let Ok(test_num) = choice.parse::<i32>() {
+        if (1..=3).contains(&test_num) {
+            vec![test_num]
+        } else {
+            vec![1] // Default to zero-copy test
         }
-        "2" => {
-            // Process all documents
-            println!("\n=== Memory-Optimized Processing (All Documents) ===");
-            print_memory_stats("Before processing all documents");
+    } else {
+        vec![1] // Default to zero-copy test
+    };
 
-            sleep(Duration::from_secs(5));
+    for test in &tests_to_run {
+        match test {
+            1 => {
+                // Process all documents using zero-copy IPC
+                println!("\n=== Zero-Copy IPC Processing (All Documents) ===");
+                print_memory_stats("Before processing with zero-copy");
 
-            let start = Instant::now();
-            match get_all_field_values(field_name, arrow_file_path) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("All documents processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
+                let start = Instant::now();
+                match get_field_values_zero_copy(field_name, arrow_file_path) {
+                    Ok((results, stats)) => {
+                        let elapsed = start.elapsed();
+                        println!("All documents processed in {:?}", elapsed);
+                        println!("Number of unique values: {}", results.len());
 
-                    // Print total document count
-                    let total_docs: usize = results.values().map(|ids| ids.len()).sum();
-                    println!("Total document references: {}", total_docs);
+                        // Print total document count
+                        let total_docs: usize = results.values().map(|ids| ids.len()).sum();
+                        println!("Total document references: {}", total_docs);
 
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!(
-                            "  {} -> {} documents (first few: {:?})",
-                            value,
-                            ids.len(),
-                            &ids[..std::cmp::min(5, ids.len())]
-                        );
+                        // Print first few results
+                        println!("\nFirst few values:");
+                        for (value, ids) in results.iter().take(5) {
+                            println!(
+                                "  {} -> {} documents (first few: {:?})",
+                                value,
+                                ids.len(),
+                                &ids[..std::cmp::min(5, ids.len())]
+                            );
+                        }
+
+                        // Calculate rows per second
+                        let rows_per_second = num_rows as f64 / elapsed.as_secs_f64();
+                        println!("\nPerformance: {:.2} rows/second", rows_per_second);
+
+                        // Add benchmark stats
+                        all_benchmark_stats.push(stats);
                     }
-
-                    // Calculate rows per second
-                    let rows_per_second = num_rows as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} rows/second", rows_per_second);
-
-                    drop(results);
+                    Err(e) => eprintln!("Error processing with zero-copy: {}", e),
                 }
-                Err(e) => eprintln!("Error processing all documents: {}", e),
+
+                print_memory_stats("After processing with zero-copy");
             }
+            2 => {
+                // Generate random document IDs
+                let mut rng = thread_rng();
+                let total_docs = num_rows; // Total number of documents to select from
+                let num_docs = 100; // Number of documents to process (increased for better measurement)
+                let mut doc_ids: Vec<usize> = (0..total_docs).collect();
+                doc_ids.shuffle(&mut rng);
+                let doc_ids = doc_ids[..num_docs].to_vec();
 
-            sleep(Duration::from_secs(5));
+                println!(
+                    "Selected {} random documents from a pool of {}",
+                    num_docs, total_docs
+                );
 
-            print_memory_stats("After processing all documents");
-        }
-        "3" => {
-            // Process a range of rows
-            println!("\nEnter start row (0-based index):");
-            let mut start_row_input = String::new();
-            std::io::stdin().read_line(&mut start_row_input).unwrap();
-            let start_row: usize = start_row_input.trim().parse().unwrap_or(0);
+                // Process the field using the zero-copy approach for specific doc_ids
+                println!("\n=== Zero-Copy IPC Processing (Specific Document IDs) ===");
+                print_memory_stats("Before processing with zero-copy");
 
-            println!("Enter end row (leave empty for all rows from start):");
-            let mut end_row_input = String::new();
-            std::io::stdin().read_line(&mut end_row_input).unwrap();
-            let end_row: Option<usize> = if end_row_input.trim().is_empty() {
-                None
-            } else {
-                Some(end_row_input.trim().parse().unwrap_or(num_rows))
-            };
+                let start = Instant::now();
+                match get_field_values_by_doc_ids_zero_copy(field_name, &doc_ids, arrow_file_path) {
+                    Ok((results, stats)) => {
+                        let elapsed = start.elapsed();
+                        println!("Field processed in {:?}", elapsed);
+                        println!("Number of unique values: {}", results.len());
 
-            println!(
-                "\n=== Memory-Optimized Processing (Row Range: {} to {}) ===",
-                start_row,
-                end_row.map_or("end".to_string(), |v| v.to_string())
-            );
-            print_memory_stats("Before processing row range");
+                        // Print first few results
+                        println!("\nFirst few values:");
+                        for (value, ids) in results.iter().take(5) {
+                            println!(
+                                "  {} -> {} documents (first few: {:?})",
+                                value,
+                                ids.len(),
+                                &ids[..std::cmp::min(5, ids.len())]
+                            );
+                        }
 
-            let start = Instant::now();
-            match get_field_values_by_row_range(field_name, arrow_file_path, start_row, end_row) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("Row range processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
+                        // Calculate ops per second (documents processed)
+                        let docs_per_second = num_docs as f64 / elapsed.as_secs_f64();
+                        println!("\nPerformance: {:.2} documents/second", docs_per_second);
 
-                    // Print total document count
-                    let total_docs: usize = results.values().map(|ids| ids.len()).sum();
-                    println!("Total document references: {}", total_docs);
-
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!(
-                            "  {} -> {} documents (first few: {:?})",
-                            value,
-                            ids.len(),
-                            &ids[..std::cmp::min(5, ids.len())]
-                        );
+                        // Add benchmark stats
+                        all_benchmark_stats.push(stats);
                     }
-
-                    // Calculate rows per second
-                    let processed_rows = end_row.unwrap_or(num_rows).saturating_sub(start_row);
-                    let rows_per_second = processed_rows as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} rows/second", rows_per_second);
+                    Err(e) => eprintln!("Error processing with zero-copy: {}", e),
                 }
-                Err(e) => eprintln!("Error processing row range: {}", e),
+
+                print_memory_stats("After processing with zero-copy");
             }
-
-            print_memory_stats("After processing row range");
-        }
-        "4" => {
-            // Process all documents using zero-copy IPC
-            println!("\n=== Zero-Copy IPC Processing (All Documents) ===");
-            print_memory_stats("Before processing with zero-copy");
-
-            let start = Instant::now();
-            match get_field_values_zero_copy(field_name, arrow_file_path) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("All documents processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
-
-                    // Print total document count
-                    let total_docs: usize = results.values().map(|ids| ids.len()).sum();
-                    println!("Total document references: {}", total_docs);
-
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!(
-                            "  {} -> {} documents (first few: {:?})",
-                            value,
-                            ids.len(),
-                            &ids[..std::cmp::min(5, ids.len())]
-                        );
-                    }
-
-                    // Calculate rows per second
-                    let rows_per_second = num_rows as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} rows/second", rows_per_second);
-                }
-                Err(e) => eprintln!("Error processing with zero-copy: {}", e),
-            }
-
-            print_memory_stats("After processing with zero-copy");
-        }
-        "5" => {
-            // Generate random document IDs
-            let mut rng = thread_rng();
-            let total_docs = num_rows; // Total number of documents to select from
-            let num_docs = 100; // Number of documents to process
-            let mut doc_ids: Vec<usize> = (0..total_docs).collect();
-            doc_ids.shuffle(&mut rng);
-            let doc_ids = doc_ids[..num_docs].to_vec();
-
-            println!(
-                "Selected {} random documents from a pool of {}",
-                num_docs, total_docs
-            );
-
-            // Process specific document IDs using zero-copy IPC
-            println!("\n=== Zero-Copy IPC Processing (Specific Document IDs) ===");
-            print_memory_stats("Before processing");
-
-            let start = Instant::now();
-            match get_field_values_by_doc_ids_zero_copy(field_name, &doc_ids, arrow_file_path) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("Field processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
-
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!("  {} -> documents: {:?}", value, ids);
-                    }
-
-                    // Calculate ops per second (documents processed)
-                    let docs_per_second = num_docs as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} documents/second", docs_per_second);
-                }
-                Err(e) => eprintln!("Error processing field: {}", e),
-            }
-
-            print_memory_stats("After processing");
-        }
-        "6" => {
-            // Process a range of rows using zero-copy IPC
-            println!("\nEnter start row (0-based index):");
-            let mut start_row_input = String::new();
-            std::io::stdin().read_line(&mut start_row_input).unwrap();
-            let start_row: usize = start_row_input.trim().parse().unwrap_or(0);
-
-            println!("Enter end row (leave empty for all rows from start):");
-            let mut end_row_input = String::new();
-            std::io::stdin().read_line(&mut end_row_input).unwrap();
-            let end_row: Option<usize> = if end_row_input.trim().is_empty() {
-                None
-            } else {
-                Some(end_row_input.trim().parse().unwrap_or(num_rows))
-            };
-
-            println!(
-                "\n=== Zero-Copy IPC Processing (Row Range: {} to {}) ===",
-                start_row,
-                end_row.map_or("end".to_string(), |v| v.to_string())
-            );
-            print_memory_stats("Before processing row range");
-
-            let start = Instant::now();
-            match get_field_values_by_row_range_zero_copy(
-                field_name,
-                arrow_file_path,
-                start_row,
-                end_row,
-            ) {
-                Ok(results) => {
-                    let elapsed = start.elapsed();
-                    println!("Row range processed in {:?}", elapsed);
-                    println!("Number of unique values: {}", results.len());
-
-                    // Print total document count
-                    let total_docs: usize = results.values().map(|ids| ids.len()).sum();
-                    println!("Total document references: {}", total_docs);
-
-                    // Print first few results
-                    println!("\nFirst few values:");
-                    for (value, ids) in results.iter().take(5) {
-                        println!(
-                            "  {} -> {} documents (first few: {:?})",
-                            value,
-                            ids.len(),
-                            &ids[..std::cmp::min(5, ids.len())]
-                        );
-                    }
-
-                    // Calculate rows per second
-                    let processed_rows = end_row.unwrap_or(num_rows).saturating_sub(start_row);
-                    let rows_per_second = processed_rows as f64 / elapsed.as_secs_f64();
-                    println!("\nPerformance: {:.2} rows/second", rows_per_second);
-                }
-                Err(e) => eprintln!("Error processing row range: {}", e),
-            }
-
-            print_memory_stats("After processing row range");
-        }
-        "7" => {
-            // Calculate numeric statistics with zero-copy IPC
-            println!("\n=== Calculate Numeric Statistics with Zero-Copy IPC ===");
-            print_memory_stats("Before calculating statistics");
-
-            // Select a numeric field if needed
-            let numeric_field_name = if field_name.contains("payload_size")
-                || field_name.contains("login_time_ms")
-                || field_name.contains("clicks")
-                || field_name.contains("doc_id")
-            {
-                field_name.to_string()
-            } else {
-                println!("\nThe selected field '{}' may not be numeric.", field_name);
-                println!("Select a numeric field:");
-                println!("1. doc_id");
-                println!("2. user.metrics.login_time_ms");
-                println!("3. user.metrics.clicks");
-                println!("4. payload_size");
-
-                let mut field_choice = String::new();
-                std::io::stdin().read_line(&mut field_choice).unwrap();
-                match field_choice.trim() {
-                    "1" => "doc_id",
-                    "2" => "user.metrics.login_time_ms",
-                    "3" => "user.metrics.clicks",
-                    "4" => "payload_size",
-                    _ => "payload_size", // default to a safe choice
-                }
-                .to_string()
-            };
-
-            println!("Using numeric field: {}", numeric_field_name);
-
-            // Ask for specific document IDs (optional)
-            println!("\nDo you want to calculate statistics for specific document IDs? (y/n)");
-            let mut specific_ids = String::new();
-            std::io::stdin().read_line(&mut specific_ids).unwrap();
-
-            let doc_ids = if specific_ids.trim().to_lowercase() == "y" {
-                println!("Enter number of random document IDs to sample:");
-                let mut num_docs_str = String::new();
-                std::io::stdin().read_line(&mut num_docs_str).unwrap();
-                let num_docs: usize = num_docs_str.trim().parse().unwrap_or(100);
+            3 => {
+                // This test is only applicable for numeric fields
+                let numeric_field_name = if field_name != "user.metrics.login_time_ms"
+                    && field_name != "user.metrics.clicks"
+                    && field_name != "payload_size"
+                {
+                    println!("\nTest 7 requires a numeric field. Please choose user.metrics.login_time_ms, user.metrics.clicks, or payload_size.");
+                    println!("Using payload_size for this test.");
+                    "payload_size"
+                } else {
+                    field_name
+                };
 
                 // Generate random document IDs
                 let mut rng = thread_rng();
-                let total_docs = num_rows;
+                let total_docs = num_rows; // Total number of documents to select from
+                let num_docs = 1000; // Number of documents to process (increased for better measurement)
                 let mut doc_ids: Vec<usize> = (0..total_docs).collect();
                 doc_ids.shuffle(&mut rng);
-                doc_ids[..num_docs].to_vec()
-            } else {
-                // Use all documents from 0 to 100 as a sample
-                (0..100).collect()
-            };
+                let doc_ids = doc_ids[..num_docs].to_vec();
 
-            println!("Selected {} document IDs for statistics", doc_ids.len());
+                println!(
+                    "Selected {} random documents from a pool of {} for numeric stats",
+                    num_docs, total_docs
+                );
 
-            let start = Instant::now();
-            match get_numeric_stats_by_doc_ids_zero_copy::<i64>(
-                numeric_field_name.as_str(),
-                &doc_ids,
-                arrow_file_path,
-            ) {
-                Ok(stats) => {
-                    let elapsed = start.elapsed();
-                    println!("Numeric statistics calculated in {:?}", elapsed);
-                    println!("Sum: {}", stats.sum);
-                    println!("Max: {}", stats.max);
-                    println!("Min: {}", stats.min);
+                // Calculate numeric stats using zero-copy approach
+                println!("\n=== Zero-Copy IPC Numeric Stats Processing ===");
+                print_memory_stats("Before processing");
+
+                let start = Instant::now();
+                match get_numeric_stats_by_doc_ids_zero_copy::<i64>(
+                    numeric_field_name,
+                    &doc_ids,
+                    arrow_file_path,
+                ) {
+                    Ok(stats_result) => {
+                        let elapsed = start.elapsed();
+                        println!("Numeric stats calculated in {:?}", elapsed);
+                        println!(
+                            "\nStatistics for field '{}' across {} documents:",
+                            numeric_field_name, num_docs
+                        );
+                        println!("  Sum: {}", stats_result.sum);
+                        println!("  Min: {}", stats_result.min);
+                        println!("  Max: {}", stats_result.max);
+                        println!(
+                            "  Average: {:.2}",
+                            stats_result.sum as f64 / num_docs as f64
+                        );
+
+                        // Calculate ops per second
+                        let docs_per_second = num_docs as f64 / elapsed.as_secs_f64();
+                        println!("\nPerformance: {:.2} documents/second", docs_per_second);
+
+                        // Create and add benchmark stats
+                        let mut query_stats = QueryStats::new(
+                            "get_numeric_stats_by_doc_ids_zero_copy",
+                            numeric_field_name,
+                            num_docs,
+                        );
+                        query_stats.add_timing(Duration::from_secs(0), elapsed);
+                        query_stats = query_stats.finish(3); // 3 stats: sum, min, max
+                        all_benchmark_stats.push(query_stats);
+                    }
+                    Err(e) => eprintln!("Error calculating numeric stats: {}", e),
                 }
-                Err(e) => eprintln!("Error calculating statistics: {}", e),
-            }
 
-            print_memory_stats("After calculating statistics");
+                print_memory_stats("After processing");
+            }
+            _ => {
+                // Test options 2, 3, and 6 are not implemented in this shorter version
+                println!("Test {} not implemented in this shorter version", test);
+            }
         }
-        _ => {
-            println!("Invalid choice, exiting.");
-            return;
-        }
+    }
+
+    // Print benchmark results
+    if !all_benchmark_stats.is_empty() {
+        println!("\n=== BENCHMARK RESULTS ===");
+        print_benchmark_table(&all_benchmark_stats);
     }
 
     // Keep the program alive for final monitoring
     println!("\nPress Enter to exit...");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).unwrap();
-}
-
-fn arrow_array() -> Int32Array {
-    let array = Int32Array::from(vec![Some(2), None, Some(5), None]);
-    assert_eq!(array.value(0), 2);
-    array
-}
-
-fn array_array_builder() -> Int32Array {
-    let mut array_builder = Int32Array::builder(100);
-    array_builder.append_value(1);
-    array_builder.append_null();
-    array_builder.append_value(3);
-    array_builder.append_value(4);
-    array_builder.finish()
 }
 
 /// Statistics for numeric fields, supporting both scalar and list fields
@@ -2219,189 +1399,21 @@ pub struct NumericStats<T> {
     pub min: T,
 }
 
-/// Calculates numeric statistics for a field across specified document IDs
 /// Supports both scalar numeric fields and lists of numeric values
 /// Generic type T must implement numeric traits for calculations
-fn get_numeric_stats_by_doc_ids<T: 'static + std::fmt::Debug>(
-    field_name: &str,
-    batch: &RecordBatch,
-    doc_ids: &[usize],
-) -> Result<NumericStats<T>, ArrowError>
-where
-    T: num::traits::Num + num::traits::FromPrimitive + std::cmp::Ord + std::cmp::PartialOrd + Copy,
-{
-    let column_index = batch.schema().index_of(field_name).map_err(|_| {
-        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-    })?;
-
-    let column = batch.column(column_index);
-    let data_type = column.data_type();
-
-    // Check if this is a numeric type
-    match data_type {
-        DataType::Int32 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| {
-                    ArrowError::InvalidArgumentError("Failed to downcast to Int32Array".to_string())
-                })?;
-
-            let mut sum = T::zero();
-            let mut max = None;
-            let mut min = None;
-
-            for &doc_id in doc_ids {
-                if doc_id < array.len() && !array.is_null(doc_id) {
-                    let value = T::from_i32(array.value(doc_id)).ok_or_else(|| {
-                        ArrowError::InvalidArgumentError(
-                            "Failed to convert Int32 to target type".to_string(),
-                        )
-                    })?;
-
-                    sum = sum + value;
-                    max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
-                    min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
-                }
-            }
-
-            Ok(NumericStats {
-                sum,
-                max: max.unwrap_or_else(T::zero),
-                min: min.unwrap_or_else(T::zero),
-            })
-        }
-        DataType::Int64 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    ArrowError::InvalidArgumentError("Failed to downcast to Int64Array".to_string())
-                })?;
-
-            let mut sum = T::zero();
-            let mut max = None;
-            let mut min = None;
-
-            for &doc_id in doc_ids {
-                if doc_id < array.len() && !array.is_null(doc_id) {
-                    let value = T::from_i64(array.value(doc_id)).ok_or_else(|| {
-                        ArrowError::InvalidArgumentError(
-                            "Failed to convert Int64 to target type".to_string(),
-                        )
-                    })?;
-
-                    sum = sum + value;
-                    max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
-                    min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
-                }
-            }
-
-            Ok(NumericStats {
-                sum,
-                max: max.unwrap_or_else(T::zero),
-                min: min.unwrap_or_else(T::zero),
-            })
-        }
-        DataType::List(field) => match field.data_type() {
-            DataType::Int32 => {
-                let list_array: &GenericListArray<i32> =
-                    column.as_any().downcast_ref().ok_or_else(|| {
-                        ArrowError::InvalidArgumentError(
-                            "Failed to downcast to list array".to_string(),
-                        )
-                    })?;
-
-                let mut sum = T::zero();
-                let mut max = None;
-                let mut min = None;
-
-                for &doc_id in doc_ids {
-                    if doc_id < list_array.len() {
-                        let values = list_array.value(doc_id);
-                        let int_array = values.as_primitive::<Int32Type>();
-
-                        for i in 0..int_array.len() {
-                            if !int_array.is_null(i) {
-                                let value = T::from_i32(int_array.value(i)).ok_or_else(|| {
-                                    ArrowError::InvalidArgumentError(
-                                        "Failed to convert Int32 to target type".to_string(),
-                                    )
-                                })?;
-
-                                sum = sum + value;
-                                max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
-                                min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
-                            }
-                        }
-                    }
-                }
-
-                Ok(NumericStats {
-                    sum,
-                    max: max.unwrap_or_else(T::zero),
-                    min: min.unwrap_or_else(T::zero),
-                })
-            }
-            DataType::Int64 => {
-                let list_array: &GenericListArray<i32> =
-                    column.as_any().downcast_ref().ok_or_else(|| {
-                        ArrowError::InvalidArgumentError(
-                            "Failed to downcast to list array".to_string(),
-                        )
-                    })?;
-
-                let mut sum = T::zero();
-                let mut max = None;
-                let mut min = None;
-
-                for &doc_id in doc_ids {
-                    if doc_id < list_array.len() {
-                        let values = list_array.value(doc_id);
-                        let int_array = values.as_primitive::<Int64Type>();
-
-                        for i in 0..int_array.len() {
-                            if !int_array.is_null(i) {
-                                let value = T::from_i64(int_array.value(i)).ok_or_else(|| {
-                                    ArrowError::InvalidArgumentError(
-                                        "Failed to convert Int64 to target type".to_string(),
-                                    )
-                                })?;
-
-                                sum = sum + value;
-                                max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
-                                min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
-                            }
-                        }
-                    }
-                }
-
-                Ok(NumericStats {
-                    sum,
-                    max: max.unwrap_or_else(T::zero),
-                    min: min.unwrap_or_else(T::zero),
-                })
-            }
-            _ => Err(ArrowError::InvalidArgumentError(
-                "List field must contain numeric values".to_string(),
-            )),
-        },
-        _ => Err(ArrowError::InvalidArgumentError(
-            "Field must be a numeric type or a list of numeric values".to_string(),
-        )),
-    }
-}
-
-/// Calculates numeric statistics for a field across specified document IDs using zero-copy approach
-/// Supports both scalar numeric fields and lists of numeric values
-/// Generic type T must implement numeric traits for calculations
-fn get_numeric_stats_by_doc_ids_zero_copy<T: 'static + std::fmt::Debug>(
+fn get_numeric_stats_by_doc_ids_zero_copy<T>(
     field_name: &str,
     doc_ids: &[usize],
     file_path: &str,
 ) -> Result<NumericStats<T>, ArrowError>
 where
-    T: num::traits::Num + num::traits::FromPrimitive + std::cmp::Ord + std::cmp::PartialOrd + Copy,
+    T: 'static
+        + std::fmt::Debug
+        + num::traits::Num
+        + num::traits::FromPrimitive
+        + std::cmp::Ord
+        + std::cmp::PartialOrd
+        + Copy,
 {
     // Initialize with default values
     let mut sum = T::zero();
@@ -2645,4 +1657,155 @@ where
         max: max.unwrap_or_else(T::zero),
         min: min.unwrap_or_else(T::zero),
     })
+}
+
+/// Process a column for all rows
+/// Returns the number of string values processed
+fn process_column_for_all_rows(
+    array: &ArrayRef,
+    row_offset: usize,
+    value_to_doc_ids: &mut HashMap<String, Vec<usize>>,
+) -> Result<usize, ArrowError> {
+    let mut strings_processed = 0;
+
+    match array.data_type() {
+        DataType::List(field) => {
+            match field.data_type() {
+                DataType::Utf8 => {
+                    let list_array: &GenericListArray<i32> =
+                        array.as_any().downcast_ref().ok_or_else(|| {
+                            ArrowError::InvalidArgumentError(
+                                "Failed to downcast to list array".to_string(),
+                            )
+                        })?;
+
+                    // Process all rows in the list array
+                    for doc_id in 0..list_array.len() {
+                        let global_doc_id = row_offset + doc_id;
+
+                        if !list_array.is_null(doc_id) {
+                            let values = list_array.value(doc_id);
+                            let string_array = values
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| {
+                                    ArrowError::InvalidArgumentError(
+                                        "Failed to downcast to string array".to_string(),
+                                    )
+                                })?;
+
+                            for j in 0..string_array.len() {
+                                if !string_array.is_null(j) {
+                                    let value = string_array.value(j).to_string();
+                                    strings_processed += 1;
+
+                                    // Use entry API to avoid duplicate lookups
+                                    value_to_doc_ids
+                                        .entry(value)
+                                        .or_insert_with(|| Vec::with_capacity(8))
+                                        .push(global_doc_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    let list_array: &GenericListArray<i32> =
+                        array.as_any().downcast_ref().ok_or_else(|| {
+                            ArrowError::InvalidArgumentError(
+                                "Failed to downcast to list array".to_string(),
+                            )
+                        })?;
+
+                    // Process all rows in the list array
+                    for doc_id in 0..list_array.len() {
+                        let global_doc_id = row_offset + doc_id;
+
+                        if !list_array.is_null(doc_id) {
+                            let values = list_array.value(doc_id);
+                            let int_array = values.as_primitive::<Int32Type>();
+
+                            for j in 0..int_array.len() {
+                                if !int_array.is_null(j) {
+                                    let value = int_array.value(j).to_string();
+                                    strings_processed += 1;
+
+                                    value_to_doc_ids
+                                        .entry(value)
+                                        .or_insert_with(|| Vec::with_capacity(8))
+                                        .push(global_doc_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // For other types, use the generic approach
+                    if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i32>>()
+                    {
+                        for doc_id in 0..list_array.len() {
+                            let global_doc_id = row_offset + doc_id;
+
+                            if !list_array.is_null(doc_id) {
+                                let values = list_array.value(doc_id);
+                                let len = values.len();
+
+                                for j in 0..len {
+                                    if !values.is_null(j) {
+                                        let value = format!("{:?}", values.as_any());
+                                        strings_processed += 1;
+
+                                        value_to_doc_ids
+                                            .entry(value)
+                                            .or_insert_with(|| Vec::with_capacity(8))
+                                            .push(global_doc_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // For scalar arrays (non-list)
+            let num_rows = array.len();
+
+            for doc_id in 0..num_rows {
+                let global_doc_id = row_offset + doc_id;
+
+                if !array.is_null(doc_id) {
+                    let value = match array.data_type() {
+                        DataType::Utf8 => {
+                            let string_array =
+                                array.as_any().downcast_ref::<StringArray>().unwrap();
+                            string_array.value(doc_id).to_string()
+                        }
+                        DataType::Boolean => {
+                            let bool_array = array.as_boolean();
+                            bool_array.value(doc_id).to_string()
+                        }
+                        DataType::Int32 => {
+                            let int_array = array.as_primitive::<Int32Type>();
+                            int_array.value(doc_id).to_string()
+                        }
+                        DataType::Int64 => {
+                            let int_array = array.as_primitive::<Int64Type>();
+                            int_array.value(doc_id).to_string()
+                        }
+                        _ => format!("{:?}", array.as_any()),
+                    };
+
+                    strings_processed += 1;
+
+                    value_to_doc_ids
+                        .entry(value)
+                        .or_insert_with(|| Vec::with_capacity(8))
+                        .push(global_doc_id);
+                }
+            }
+        }
+    }
+
+    Ok(strings_processed)
 }
