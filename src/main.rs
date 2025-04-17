@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::process;
 use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -224,15 +225,6 @@ fn print_memory_stats(stage: &str) {
     println!("==============================\n");
 }
 
-/// Write a record batch to an Arrow IPC file
-fn write_batch_ipc(path: &str, batch: &RecordBatch) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = FileWriter::try_new(file, &batch.schema()).unwrap();
-    writer.write(batch).unwrap();
-    writer.finish().unwrap();
-    Ok(())
-}
-
 /// Creates a schema for log records with nested fields
 /// The schema supports the format from generate_random_json:
 /// - doc_id: document ID for lookups
@@ -305,11 +297,11 @@ fn create_logs_schema() -> Schema {
     ])
 }
 
-/// Creates a large record batch with specified number of rows
-fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
+/// Creates a record batch with specified number of rows
+fn create_record_batch(start_idx: usize, num_rows: usize) -> ArrowResult<RecordBatch> {
     let schema = create_logs_schema();
 
-    // Create builders with larger capacity
+    // Create builders with sufficient capacity
     let mut doc_id_builder = Int64Builder::new();
     let mut timestamp_builder = TimestampMillisecondArray::builder(num_rows);
     let mut level_builder = StringBuilder::new();
@@ -331,8 +323,8 @@ fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
     let mut raw_int_size = 0;
     let mut total_strings = 0;
 
-    // Generate large amount of data using the random JSON generator
-    for i in 0..num_rows {
+    // Generate data using the random JSON generator
+    for i in start_idx..(start_idx + num_rows) {
         // Generate a random JSON document for this record
         let json_data = generate_random_json(i);
 
@@ -342,7 +334,6 @@ fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
 
         // Make sure we're using timestamp in milliseconds to match the schema
         let timestamp_millis = json_data["timestamp"].as_i64().unwrap();
-        println!("Adding timestamp: {}", timestamp_millis); // Debugging
         timestamp_builder.append_value(timestamp_millis);
         raw_int_size += std::mem::size_of::<i64>();
 
@@ -418,28 +409,31 @@ fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
         answers_nx_domain_builder.append(true);
     }
 
-    // Calculate and print raw data size statistics
-    let total_raw_size = raw_string_size + raw_int_size;
-    println!("\n=== Raw Data Size Statistics ===");
-    println!("Number of rows: {}", num_rows);
-    println!("Number of strings: {}", total_strings);
-    println!(
-        "Raw string data size: {} bytes ({:.2} MB)",
-        raw_string_size,
-        raw_string_size as f64 / (1024.0 * 1024.0)
-    );
-    println!(
-        "Raw integer data size: {} bytes ({:.2} MB)",
-        raw_int_size,
-        raw_int_size as f64 / (1024.0 * 1024.0)
-    );
-    println!(
-        "Total raw data size: {} bytes ({:.2} MB)",
-        total_raw_size,
-        total_raw_size as f64 / (1024.0 * 1024.0)
-    );
-    println!("Average per row: {} bytes", total_raw_size / num_rows);
-    println!("==============================\n");
+    // For the first batch, calculate and print raw data size statistics
+    if start_idx == 0 {
+        let total_raw_size = raw_string_size + raw_int_size;
+        println!("\n=== Raw Data Size Statistics ===");
+        println!("Batch number: 1 (first batch)");
+        println!("Number of rows in this batch: {}", num_rows);
+        println!("Number of strings: {}", total_strings);
+        println!(
+            "Raw string data size: {} bytes ({:.2} MB)",
+            raw_string_size,
+            raw_string_size as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Raw integer data size: {} bytes ({:.2} MB)",
+            raw_int_size,
+            raw_int_size as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Total raw data size: {} bytes ({:.2} MB)",
+            total_raw_size,
+            total_raw_size as f64 / (1024.0 * 1024.0)
+        );
+        println!("Average per row: {} bytes", total_raw_size / num_rows);
+        println!("==============================\n");
+    }
 
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(doc_id_builder.finish()),
@@ -460,6 +454,93 @@ fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
     ];
 
     RecordBatch::try_new(Arc::new(schema), arrays)
+}
+
+/// Creates and writes multiple record batches to an Arrow IPC file with a specified batch size
+/// Returns the total memory size of all batches combined
+fn create_and_write_batches(
+    path: &str,
+    total_rows: usize,
+    batch_size: usize,
+) -> std::io::Result<usize> {
+    let file = File::create(path)?;
+    let schema = Arc::new(create_logs_schema());
+    let mut writer = FileWriter::try_new(file, &schema).unwrap();
+
+    let mut total_arrow_memory = 0;
+    let num_batches = (total_rows + batch_size - 1) / batch_size; // Ceiling division
+
+    println!(
+        "Creating {} record batches with {} rows each (total {} rows)",
+        num_batches, batch_size, total_rows
+    );
+
+    let start_time = Instant::now();
+    let mut last_report_time = start_time;
+
+    for batch_idx in 0..num_batches {
+        let start_idx = batch_idx * batch_size;
+        let actual_batch_size = std::cmp::min(batch_size, total_rows - start_idx);
+
+        // Create batch with appropriate size (might be smaller for the last batch)
+        match create_record_batch(start_idx, actual_batch_size) {
+            Ok(batch) => {
+                // Calculate in-memory size of this batch
+                let batch_memory_size = batch.get_array_memory_size();
+                total_arrow_memory += batch_memory_size;
+
+                // Write the batch
+                writer.write(&batch).unwrap();
+
+                // Report progress every 5 seconds or 10 batches, whichever comes first
+                let now = Instant::now();
+                if batch_idx % 10 == 0 || now.duration_since(last_report_time).as_secs() >= 5 {
+                    let elapsed = now.duration_since(start_time);
+                    let progress = (batch_idx + 1) as f64 / num_batches as f64 * 100.0;
+                    println!(
+                        "Batch {}/{} ({:.1}%) completed in {:.2?}",
+                        batch_idx + 1,
+                        num_batches,
+                        progress,
+                        elapsed
+                    );
+                    last_report_time = now;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error creating batch {}: {}", batch_idx, e);
+                // Continue with next batch despite error
+            }
+        }
+    }
+
+    // Finish the writer to complete the file
+    writer.finish().unwrap();
+
+    let total_time = start_time.elapsed();
+    println!(
+        "Created and wrote {} batches in {:.2?}",
+        num_batches, total_time
+    );
+    println!(
+        "Average time per batch: {:.2?}",
+        total_time / num_batches as u32
+    );
+    println!(
+        "Average time per row: {:.2?}",
+        total_time / total_rows as u32
+    );
+
+    Ok(total_arrow_memory)
+}
+
+/// Creates a large record batch with specified number of rows
+/// Kept for backward compatibility, but you should prefer create_and_write_batches
+fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
+    println!(
+        "Warning: Creating a single large batch. Consider using create_and_write_batches instead."
+    );
+    create_record_batch(0, num_rows)
 }
 
 /// Generate a random JSON document according to the specified schema
@@ -540,9 +621,8 @@ fn generate_random_json(i: usize) -> Value {
 fn process_list_array_batch_with_filter(
     array: &ArrayRef,
     filter: &[bool],
-    doc_ids: &[usize],
-    _indices: &[usize],
-    _all_doc_ids: &[usize],
+    batch_doc_ids: &[usize],
+    batch_offset: usize,
     value_to_doc_ids: &mut HashMap<String, Vec<usize>>,
 ) -> Result<(), ArrowError> {
     match array.data_type() {
@@ -557,11 +637,14 @@ fn process_list_array_batch_with_filter(
                         })?;
 
                     // Process only the filtered document IDs
-                    for &doc_id in doc_ids {
-                        // Only process if the document is in our filter
-                        if filter[doc_id] && !list_array.is_null(doc_id) {
-                            let original_doc_id = doc_id; // We're using the actual doc ID now
-                            let values = list_array.value(doc_id);
+                    for &relative_doc_id in batch_doc_ids {
+                        // Only process if the document is in our filter and within bounds of this batch
+                        if relative_doc_id < filter.len()
+                            && filter[relative_doc_id]
+                            && !list_array.is_null(relative_doc_id)
+                        {
+                            let global_doc_id = batch_offset + relative_doc_id; // Convert to global doc ID
+                            let values = list_array.value(relative_doc_id);
                             let string_array = values
                                 .as_any()
                                 .downcast_ref::<StringArray>()
@@ -577,7 +660,7 @@ fn process_list_array_batch_with_filter(
                                     value_to_doc_ids
                                         .entry(value)
                                         .or_default()
-                                        .push(original_doc_id);
+                                        .push(global_doc_id);
                                 }
                             }
                         }
@@ -592,11 +675,14 @@ fn process_list_array_batch_with_filter(
                         })?;
 
                     // Process only the filtered document IDs
-                    for &doc_id in doc_ids {
-                        // Only process if the document is in our filter
-                        if filter[doc_id] && !list_array.is_null(doc_id) {
-                            let original_doc_id = doc_id; // We're using the actual doc ID now
-                            let values = list_array.value(doc_id);
+                    for &relative_doc_id in batch_doc_ids {
+                        // Only process if the document is in our filter and within bounds of this batch
+                        if relative_doc_id < filter.len()
+                            && filter[relative_doc_id]
+                            && !list_array.is_null(relative_doc_id)
+                        {
+                            let global_doc_id = batch_offset + relative_doc_id; // Convert to global doc ID
+                            let values = list_array.value(relative_doc_id);
                             let int_array = values.as_primitive::<Int32Type>();
 
                             for j in 0..int_array.len() {
@@ -605,7 +691,7 @@ fn process_list_array_batch_with_filter(
                                     value_to_doc_ids
                                         .entry(value)
                                         .or_default()
-                                        .push(original_doc_id);
+                                        .push(global_doc_id);
                                 }
                             }
                         }
@@ -615,11 +701,14 @@ fn process_list_array_batch_with_filter(
                     // For other types, use the generic approach
                     if let Some(list_array) = array.as_any().downcast_ref::<GenericListArray<i32>>()
                     {
-                        for &doc_id in doc_ids {
-                            // Only process if the document is in our filter
-                            if filter[doc_id] && !list_array.is_null(doc_id) {
-                                let original_doc_id = doc_id; // We're using the actual doc ID now
-                                let values = list_array.value(doc_id);
+                        for &relative_doc_id in batch_doc_ids {
+                            // Only process if the document is in our filter and within bounds of this batch
+                            if relative_doc_id < filter.len()
+                                && filter[relative_doc_id]
+                                && !list_array.is_null(relative_doc_id)
+                            {
+                                let global_doc_id = batch_offset + relative_doc_id; // Convert to global doc ID
+                                let values = list_array.value(relative_doc_id);
                                 let len = values.len();
 
                                 for j in 0..len {
@@ -628,7 +717,7 @@ fn process_list_array_batch_with_filter(
                                         value_to_doc_ids
                                             .entry(value)
                                             .or_default()
-                                            .push(original_doc_id);
+                                            .push(global_doc_id);
                                     }
                                 }
                             }
@@ -651,32 +740,35 @@ fn process_list_array_batch_with_filter(
 fn process_scalar_array_batch_with_filter(
     array: &ArrayRef,
     filter: &[bool],
-    doc_ids: &[usize],
-    _indices: &[usize],
-    _all_doc_ids: &[usize],
+    batch_doc_ids: &[usize],
+    batch_offset: usize,
     value_to_doc_ids: &mut HashMap<String, Vec<usize>>,
 ) -> Result<(), ArrowError> {
     // Process only the filtered document IDs
-    for &doc_id in doc_ids {
-        // Only process if the document is in our filter
-        if filter[doc_id] && !array.is_null(doc_id) {
-            let original_doc_id = doc_id; // We're using the actual doc ID now
+    for &relative_doc_id in batch_doc_ids {
+        // Only process if the document is in our filter and within bounds of this batch
+        if relative_doc_id < filter.len()
+            && filter[relative_doc_id]
+            && !array.is_null(relative_doc_id)
+        {
+            let global_doc_id = batch_offset + relative_doc_id; // Convert to global doc ID
+
             let value = match array.data_type() {
                 DataType::Utf8 => {
                     let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
-                    string_array.value(doc_id).to_string()
+                    string_array.value(relative_doc_id).to_string()
                 }
                 DataType::Boolean => {
                     let bool_array = array.as_boolean();
-                    bool_array.value(doc_id).to_string()
+                    bool_array.value(relative_doc_id).to_string()
                 }
                 DataType::Int32 => {
                     let int_array = array.as_primitive::<Int32Type>();
-                    int_array.value(doc_id).to_string()
+                    int_array.value(relative_doc_id).to_string()
                 }
                 DataType::Int64 => {
                     let int_array = array.as_primitive::<Int64Type>();
-                    int_array.value(doc_id).to_string()
+                    int_array.value(relative_doc_id).to_string()
                 }
                 _ => format!("{:?}", array.as_any()),
             };
@@ -684,7 +776,7 @@ fn process_scalar_array_batch_with_filter(
             value_to_doc_ids
                 .entry(value)
                 .or_default()
-                .push(original_doc_id);
+                .push(global_doc_id);
         }
     }
 
@@ -730,7 +822,7 @@ fn get_field_values_zero_copy(
 
     // Use the zero-copy approach
     // We need to copy from the mmap to handle lifetime issues
-    let bytes = Bytes::copy_from_slice(&mmap[..]);
+    let bytes = Bytes::from_owner(mmap);
     // Create Buffer from Bytes (zero-copy)
     let buffer = Buffer::from(bytes);
 
@@ -744,73 +836,92 @@ fn get_field_values_zero_copy(
     let process_start = Instant::now();
 
     // We need to get the first batch to access its schema
-    if let Ok(Some(first_batch)) = decoder.get_batch(0) {
-        let schema = first_batch.schema();
-        let field_index = schema.index_of(field_name).map_err(|_| {
-            ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
-        })?;
+    let first_batch = match decoder.get_batch(0) {
+        Ok(Some(batch)) => batch,
+        _ => {
+            return Err(ArrowError::InvalidArgumentError(
+                "Failed to read the first batch to get schema".to_string(),
+            ))
+        }
+    };
 
-        // Process batches
-        let mut batch_count = 0;
-        let mut total_rows = 0;
-        let mut strings_seen = 0;
+    let schema = first_batch.schema();
+    let field_index = schema.index_of(field_name).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
+    })?;
 
-        // Process all batches one by one
-        for batch_idx in 0..decoder.num_batches() {
-            match decoder.get_batch(batch_idx) {
-                Ok(Some(batch)) => {
-                    batch_count += 1;
-                    let batch_rows = batch.num_rows();
-                    total_rows += batch_rows;
+    let total_batches = decoder.num_batches();
 
-                    // Get the column we're interested in
-                    let column = batch.column(field_index);
-                    let row_offset = total_rows - batch_rows;
+    // Drop the first batch - we don't need it anymore
+    drop(first_batch);
+    // drop(decoder);
 
-                    // Process the column for all rows
-                    let new_strings =
-                        process_column_for_all_rows(column, row_offset, &mut value_to_doc_ids)?;
-                    strings_seen += new_strings;
+    // Process batches
+    let mut batch_count = 0;
+    let mut total_rows = 0;
+    let mut strings_seen = 0;
 
-                    // Log progress periodically
-                    if batch_count % 5 == 0 {
-                        println!(
-                            "Processed {} batches, {} rows, {} unique values so far",
-                            batch_count,
-                            total_rows,
-                            value_to_doc_ids.len()
-                        );
-                    }
-                }
+    // Process all batches one by one
+    for batch_idx in 0..total_batches {
+        // Create a scope to ensure batch gets dropped after processing
+        {
+            // let mmap = unsafe {
+            //     Mmap::map(&file).map_err(|e| {
+            //         ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
+            //     })?
+            // };
+
+            // let bytes = Bytes::from_owner(mmap);
+            // let buffer = Buffer::from(bytes);
+            // let decoder = IPCBufferDecoder::new(buffer);
+
+            // Get the batch
+            let batch = match decoder.get_batch(batch_idx) {
+                Ok(Some(batch)) => batch,
                 Ok(None) => {
                     println!("Batch {} was None, skipping", batch_idx);
+                    continue;
                 }
                 Err(e) => {
                     eprintln!("Error reading batch {}: {}", batch_idx, e);
+                    continue;
                 }
-            }
-        }
+            };
 
-        println!(
-            "Processed {} batches with {} total rows",
-            batch_count, total_rows
-        );
-        println!("Found {} total string values", strings_seen);
-        println!("Resulting in {} unique values", value_to_doc_ids.len());
+            batch_count += 1;
+            let batch_rows = batch.num_rows();
+            total_rows += batch_rows;
 
-        let process_time = process_start.elapsed();
+            // Get the column we're interested in
+            let column = batch.column(field_index);
+            let row_offset = total_rows - batch_rows;
 
-        // Update stats
-        stats.add_timing(setup_time, process_time);
-        stats = stats.finish(value_to_doc_ids.len());
-        stats.print_benchmark();
+            // Process the column for all rows
+            let new_strings =
+                process_column_for_all_rows(column, row_offset, &mut value_to_doc_ids)?;
+            strings_seen += new_strings;
 
-        Ok((value_to_doc_ids, stats))
-    } else {
-        Err(ArrowError::InvalidArgumentError(
-            "Failed to read the first batch to get schema".to_string(),
-        ))
+            drop(batch);
+        } // End of scope - batch gets dropped here
     }
+
+    drop(decoder);
+
+    println!(
+        "Processed {} batches with {} total rows",
+        batch_count, total_rows
+    );
+    println!("Found {} total string values", strings_seen);
+    println!("Resulting in {} unique values", value_to_doc_ids.len());
+
+    let process_time = process_start.elapsed();
+
+    // Update stats
+    stats.add_timing(setup_time, process_time);
+    stats = stats.finish(value_to_doc_ids.len());
+    stats.print_benchmark();
+
+    Ok((value_to_doc_ids, stats))
 }
 
 /// Retrieves field values by specific document IDs using zero-copy IPC
@@ -844,7 +955,7 @@ fn get_field_values_by_doc_ids_zero_copy(
 
     // Use the zero-copy approach
     // We need to copy from the mmap to handle lifetime issues
-    let bytes = Bytes::copy_from_slice(&mmap[..]);
+    let bytes = Bytes::from_owner(mmap);
     let buffer = Buffer::from(bytes);
 
     // Create the IPCBufferDecoder which will efficiently decode record batches
@@ -876,83 +987,73 @@ fn get_field_values_by_doc_ids_zero_copy(
 
         // Process batches in sequence
         for batch_idx in 0..decoder.num_batches() {
-            match decoder.get_batch(batch_idx) {
-                Ok(Some(batch)) => {
-                    batch_count += 1;
-                    let batch_rows = batch.num_rows();
-
-                    // Find which document IDs are in this batch
-                    let mut batch_doc_ids = Vec::new();
-                    let batch_indices = Vec::new();
-
-                    for (i, &doc_id) in sorted_doc_ids.iter().enumerate() {
-                        let effective_doc_id = doc_id.saturating_sub(row_offset);
-                        if !processed_ids[i]
-                            && doc_id >= row_offset
-                            && effective_doc_id < batch_rows
-                        {
-                            batch_doc_ids.push((i, effective_doc_id, doc_id));
-                            processed_ids[i] = true;
-                            processed_doc_ids += 1;
-                        }
+            // Create a scope to ensure batch gets dropped after processing
+            {
+                let batch = match decoder.get_batch(batch_idx) {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => {
+                        println!("Batch {} was None, skipping", batch_idx);
+                        continue;
                     }
-
-                    // If we found any document IDs in this batch, process them
-                    if !batch_doc_ids.is_empty() {
-                        let column = batch.column(field_index).clone();
-
-                        // Process based on the data type
-                        if let DataType::List(_) = column.data_type() {
-                            let mut filter = vec![false; batch_rows];
-                            for &doc_id in &batch_doc_ids {
-                                filter[doc_id.1] = true;
-                            }
-
-                            process_list_array_batch_with_filter(
-                                &column,
-                                &filter,
-                                &batch_doc_ids
-                                    .iter()
-                                    .map(|&(_, _, doc_id)| doc_id)
-                                    .collect::<Vec<_>>(),
-                                &batch_indices,
-                                &sorted_doc_ids,
-                                &mut value_to_doc_ids,
-                            )?;
-                        } else {
-                            let mut filter = vec![false; batch_rows];
-                            for &doc_id in &batch_doc_ids {
-                                filter[doc_id.1] = true;
-                            }
-
-                            process_scalar_array_batch_with_filter(
-                                &column,
-                                &filter,
-                                &batch_doc_ids
-                                    .iter()
-                                    .map(|&(_, _, doc_id)| doc_id)
-                                    .collect::<Vec<_>>(),
-                                &batch_indices,
-                                &sorted_doc_ids,
-                                &mut value_to_doc_ids,
-                            )?;
-                        }
+                    Err(e) => {
+                        eprintln!("Error reading batch {}: {}", batch_idx, e);
+                        continue;
                     }
+                };
 
-                    row_offset += batch_rows;
+                batch_count += 1;
+                let batch_rows = batch.num_rows();
 
-                    // If we've processed all document IDs, we can stop
-                    if processed_doc_ids == sorted_doc_ids.len() {
-                        println!("All document IDs processed after {} batches", batch_count);
-                        break;
+                // Find which document IDs are in this batch
+                let mut batch_doc_ids = Vec::new();
+
+                for (i, &doc_id) in sorted_doc_ids.iter().enumerate() {
+                    let effective_doc_id = doc_id.saturating_sub(row_offset);
+                    if !processed_ids[i] && doc_id >= row_offset && effective_doc_id < batch_rows {
+                        batch_doc_ids.push(effective_doc_id); // Store relative doc ID within this batch
+                        processed_ids[i] = true;
+                        processed_doc_ids += 1;
                     }
                 }
-                Ok(None) => {
-                    println!("Batch {} was None, skipping", batch_idx);
+
+                // If we found any document IDs in this batch, process them
+                if !batch_doc_ids.is_empty() {
+                    let column = batch.column(field_index).clone();
+
+                    // Process based on the data type
+                    if let DataType::List(_) = column.data_type() {
+                        let filter = vec![true; batch_rows]; // Use a simple filter for all rows
+                        process_list_array_batch_with_filter(
+                            &column,
+                            &filter,
+                            &batch_doc_ids,
+                            row_offset,
+                            &mut value_to_doc_ids,
+                        )?;
+                    } else {
+                        let filter = vec![true; batch_rows]; // Use a simple filter for all rows
+                        process_scalar_array_batch_with_filter(
+                            &column,
+                            &filter,
+                            &batch_doc_ids,
+                            row_offset,
+                            &mut value_to_doc_ids,
+                        )?;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Error reading batch {}: {}", batch_idx, e);
+
+                row_offset += batch_rows;
+
+                // If we've processed all document IDs, we can stop
+                if processed_doc_ids == sorted_doc_ids.len() {
+                    println!("All document IDs processed after {} batches", batch_count);
+                    break;
                 }
+            } // End of scope - batch gets dropped here
+
+            // Explicitly run garbage collection periodically
+            if batch_count % 50 == 0 {
+                println!("Forcing memory cleanup after {} batches", batch_count);
             }
         }
 
@@ -1093,7 +1194,8 @@ fn main() {
     println!("  # or");
     println!("  ps -o pid,rss,vsz,command -p {}\n", pid);
 
-    let num_rows: usize = 15_000_000;
+    let num_rows: usize = 10_000_000;
+    let batch_size: usize = 1_000_000; // Default batch size of 100k rows
 
     // Print initial memory usage
     print_memory_stats("Program Start");
@@ -1112,69 +1214,52 @@ fn main() {
     // Create a large Arrow file if it doesn't exist
     let arrow_file_path = "large_segment.arrow";
     if !std::path::Path::new(arrow_file_path).exists() {
-        println!("Creating large Arrow file...");
+        println!("Creating Arrow file with multiple batches...");
         let start = Instant::now();
 
-        // Create a large record batch with 1 million rows
-        match create_large_record_batch(num_rows) {
-            Ok(batch) => {
-                // Calculate in-memory size of the Arrow data
-                let arrow_memory_size = batch.get_array_memory_size();
+        // Create and write multiple batches to the Arrow file
+        match create_and_write_batches(arrow_file_path, num_rows, batch_size) {
+            Ok(total_memory_size) => {
+                let creation_time = start.elapsed();
                 println!(
-                    "Arrow in-memory size: {} bytes ({:.2} MB)",
-                    arrow_memory_size,
-                    arrow_memory_size as f64 / (1024.0 * 1024.0)
+                    "Created Arrow file with {} rows in {:?}",
+                    num_rows, creation_time
                 );
 
-                // Write the batch to an Arrow IPC file
-                match write_batch_ipc(arrow_file_path, &batch) {
-                    Ok(_) => {
-                        let creation_time = start.elapsed();
-                        println!(
-                            "Created Arrow file with {} rows in {:?}",
-                            num_rows, creation_time
-                        );
+                // Get and print the Arrow file size
+                if let Ok(metadata) = std::fs::metadata(arrow_file_path) {
+                    let arrow_file_size = metadata.len();
+                    println!("\n=== Arrow File Size Statistics ===");
+                    println!(
+                        "Arrow IPC file size: {} bytes ({:.2} MB)",
+                        arrow_file_size,
+                        arrow_file_size as f64 / (1024.0 * 1024.0)
+                    );
 
-                        // Get and print the Arrow file size
-                        if let Ok(metadata) = std::fs::metadata(arrow_file_path) {
-                            let arrow_file_size = metadata.len();
-                            println!("\n=== Arrow File Size Statistics ===");
-                            println!(
-                                "Arrow IPC file size: {} bytes ({:.2} MB)",
-                                arrow_file_size,
-                                arrow_file_size as f64 / (1024.0 * 1024.0)
-                            );
+                    // Compare with in-memory size
+                    println!(
+                        "Arrow in-memory size: {} bytes ({:.2} MB)",
+                        total_memory_size,
+                        total_memory_size as f64 / (1024.0 * 1024.0)
+                    );
 
-                            // Compare with in-memory size
-                            println!(
-                                "Arrow in-memory size: {} bytes ({:.2} MB)",
-                                arrow_memory_size,
-                                arrow_memory_size as f64 / (1024.0 * 1024.0)
-                            );
+                    // Calculate storage efficiency
+                    let storage_ratio = arrow_file_size as f64 / total_memory_size as f64;
+                    println!(
+                        "Storage ratio (file size / in-memory size): {:.2}",
+                        storage_ratio
+                    );
 
-                            // Calculate storage efficiency
-                            let storage_ratio = arrow_file_size as f64 / arrow_memory_size as f64;
-                            println!(
-                                "Storage ratio (file size / in-memory size): {:.2}",
-                                storage_ratio
-                            );
-
-                            // Calculate bytes per row
-                            println!(
-                                "Average bytes per row in Arrow file: {:.2} bytes",
-                                arrow_file_size as f64 / num_rows as f64
-                            );
-                            println!("==============================\n");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to write Arrow file: {}", e);
-                        return;
-                    }
+                    // Calculate bytes per row
+                    println!(
+                        "Average bytes per row in Arrow file: {:.2} bytes",
+                        arrow_file_size as f64 / num_rows as f64
+                    );
+                    println!("==============================\n");
                 }
             }
             Err(e) => {
-                eprintln!("Failed to create record batch: {}", e);
+                eprintln!("Failed to write Arrow file: {}", e);
                 return;
             }
         }
@@ -1341,13 +1426,47 @@ fn main() {
                     && field_name != "user.metrics.clicks"
                     && field_name != "payload_size"
                 {
-                    println!("\nTest 7 requires a numeric field. Please choose user.metrics.login_time_ms, user.metrics.clicks, or payload_size.");
+                    println!("\nTest 3 requires a numeric field. Please choose user.metrics.login_time_ms, user.metrics.clicks, or payload_size.");
                     println!("Using payload_size for this test.");
                     "payload_size"
                 } else {
                     field_name
                 };
 
+                // Calculate numeric stats using zero-copy approach for all documents
+                println!("\n=== Zero-Copy IPC Numeric Stats Processing (All Documents) ===");
+                print_memory_stats("Before processing");
+
+                let start = Instant::now();
+                match get_numeric_stats_zero_copy::<i64>(numeric_field_name, arrow_file_path) {
+                    Ok((stats_result, query_stats)) => {
+                        let elapsed = start.elapsed();
+                        println!("Numeric stats calculated in {:?}", elapsed);
+                        println!(
+                            "\nStatistics for field '{}' across all documents:",
+                            numeric_field_name
+                        );
+                        println!("  Sum: {}", stats_result.sum);
+                        println!("  Min: {}", stats_result.min);
+                        println!("  Max: {}", stats_result.max);
+                        println!(
+                            "  Average: {:.2}",
+                            stats_result.sum as f64 / num_rows as f64
+                        );
+
+                        // Calculate rows per second
+                        let rows_per_second = num_rows as f64 / elapsed.as_secs_f64();
+                        println!("\nPerformance: {:.2} rows/second", rows_per_second);
+
+                        // Add benchmark stats
+                        all_benchmark_stats.push(query_stats);
+                    }
+                    Err(e) => eprintln!("Error calculating numeric stats: {}", e),
+                }
+
+                print_memory_stats("After processing");
+
+                // Now test with specific document IDs for comparison
                 // Generate random document IDs
                 let mut rng = thread_rng();
                 let total_docs = num_rows; // Total number of documents to select from
@@ -1361,8 +1480,10 @@ fn main() {
                     num_docs, total_docs
                 );
 
-                // Calculate numeric stats using zero-copy approach
-                println!("\n=== Zero-Copy IPC Numeric Stats Processing ===");
+                // Calculate numeric stats using zero-copy approach for specific doc IDs
+                println!(
+                    "\n=== Zero-Copy IPC Numeric Stats Processing (Specific Document IDs) ==="
+                );
                 print_memory_stats("Before processing");
 
                 let start = Instant::now();
@@ -1467,7 +1588,7 @@ where
 
     // Use the zero-copy approach
     // We need to copy from the mmap to handle lifetime issues
-    let bytes = Bytes::copy_from_slice(&mmap[..]);
+    let bytes = Bytes::from_owner(mmap);
     // Create Buffer from Bytes (zero-copy)
     let buffer = Buffer::from(bytes);
 
@@ -1693,6 +1814,287 @@ where
     })
 }
 
+/// Calculates numeric statistics for all documents in an Arrow IPC file using zero-copy approach
+/// This implementation processes all documents in the file with minimal memory usage
+/// by using the FileDecoder API with memory-mapped files
+fn get_numeric_stats_zero_copy<T>(
+    field_name: &str,
+    file_path: &str,
+) -> Result<(NumericStats<T>, QueryStats), ArrowError>
+where
+    T: 'static
+        + std::fmt::Debug
+        + num::traits::Num
+        + num::traits::FromPrimitive
+        + std::cmp::Ord
+        + std::cmp::PartialOrd
+        + Copy,
+{
+    // Create stats object
+    let mut stats = QueryStats::new("get_numeric_stats_zero_copy", field_name, 0);
+
+    // Initialize numeric stats
+    let mut sum = T::zero();
+    let mut max = None;
+    let mut min = None;
+    let mut count = 0;
+
+    // Measure setup time
+    let setup_start = Instant::now();
+
+    // Open the file and memory map it
+    let file = File::open(file_path)
+        .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to open file: {}", e)))?;
+
+    // Get file metadata
+    let file_size = file
+        .metadata()
+        .map_err(|e| {
+            ArrowError::InvalidArgumentError(format!("Failed to get file metadata: {}", e))
+        })?
+        .len();
+
+    println!("File size: {} bytes", file_size);
+
+    // Memory mapping allows us to access file contents without loading entire file into memory
+    let mmap = unsafe {
+        Mmap::map(&file).map_err(|e| {
+            ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
+        })?
+    };
+
+    // Use the zero-copy approach
+    // We need to copy from the mmap to handle lifetime issues
+    let bytes = Bytes::copy_from_slice(&mmap[..]);
+    // Create Buffer from Bytes (zero-copy)
+    let buffer = Buffer::from(bytes);
+
+    // Create the IPCBufferDecoder which will efficiently decode record batches
+    let decoder = IPCBufferDecoder::new(buffer);
+    println!("Number of batches in file: {}", decoder.num_batches());
+
+    let setup_time = setup_start.elapsed();
+
+    // Measure processing time
+    let process_start = Instant::now();
+
+    // We need to get the first batch to access its schema
+    let first_batch = match decoder.get_batch(0) {
+        Ok(Some(batch)) => batch,
+        _ => {
+            return Err(ArrowError::InvalidArgumentError(
+                "Failed to read the first batch to get schema".to_string(),
+            ))
+        }
+    };
+
+    let schema = first_batch.schema();
+    let field_index = schema.index_of(field_name).map_err(|_| {
+        ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
+    })?;
+
+    // Check if this is a numeric field
+    let field = schema.field(field_index);
+    let data_type = field.data_type();
+
+    match data_type {
+        DataType::Int32 | DataType::Int64 | DataType::List(_) => {
+            // Valid numeric type, continue
+        }
+        _ => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Field '{}' is not a numeric type or list of numeric values",
+                field_name
+            )));
+        }
+    }
+
+    // Drop the first batch - we don't need it anymore
+    drop(first_batch);
+
+    // Process batches
+    let mut batch_count = 0;
+    let mut total_rows = 0;
+
+    // Process all batches one by one
+    for batch_idx in 0..decoder.num_batches() {
+        // Create a scope to ensure batch gets dropped after processing
+        {
+            // Get the batch
+            let batch = match decoder.get_batch(batch_idx) {
+                Ok(Some(batch)) => batch,
+                Ok(None) => {
+                    println!("Batch {} was None, skipping", batch_idx);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Error reading batch {}: {}", batch_idx, e);
+                    continue;
+                }
+            };
+
+            batch_count += 1;
+            let batch_rows = batch.num_rows();
+            total_rows += batch_rows;
+
+            // Get the column we're interested in
+            let column = batch.column(field_index);
+
+            // Calculate statistics based on the data type
+            match column.data_type() {
+                DataType::Int32 => {
+                    let array = column.as_primitive::<Int32Type>();
+
+                    for row_idx in 0..batch_rows {
+                        if !array.is_null(row_idx) {
+                            let value = T::from_i32(array.value(row_idx)).ok_or_else(|| {
+                                ArrowError::InvalidArgumentError(
+                                    "Failed to convert Int32 to target type".to_string(),
+                                )
+                            })?;
+
+                            sum = sum + value;
+                            max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
+                            min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
+                            count += 1;
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    let array = column.as_primitive::<Int64Type>();
+
+                    for row_idx in 0..batch_rows {
+                        if !array.is_null(row_idx) {
+                            let value = T::from_i64(array.value(row_idx)).ok_or_else(|| {
+                                ArrowError::InvalidArgumentError(
+                                    "Failed to convert Int64 to target type".to_string(),
+                                )
+                            })?;
+
+                            sum = sum + value;
+                            max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
+                            min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
+                            count += 1;
+                        }
+                    }
+                }
+                DataType::List(field) => match field.data_type() {
+                    DataType::Int32 => {
+                        let list_array: &GenericListArray<i32> =
+                            column.as_any().downcast_ref().ok_or_else(|| {
+                                ArrowError::InvalidArgumentError(
+                                    "Failed to downcast to list array".to_string(),
+                                )
+                            })?;
+
+                        for row_idx in 0..batch_rows {
+                            if !list_array.is_null(row_idx) {
+                                let values = list_array.value(row_idx);
+                                let int_array = values.as_primitive::<Int32Type>();
+
+                                for i in 0..int_array.len() {
+                                    if !int_array.is_null(i) {
+                                        let value =
+                                            T::from_i32(int_array.value(i)).ok_or_else(|| {
+                                                ArrowError::InvalidArgumentError(
+                                                    "Failed to convert Int32 to target type"
+                                                        .to_string(),
+                                                )
+                                            })?;
+
+                                        sum = sum + value;
+                                        max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
+                                        min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DataType::Int64 => {
+                        let list_array: &GenericListArray<i32> =
+                            column.as_any().downcast_ref().ok_or_else(|| {
+                                ArrowError::InvalidArgumentError(
+                                    "Failed to downcast to list array".to_string(),
+                                )
+                            })?;
+
+                        for row_idx in 0..batch_rows {
+                            if !list_array.is_null(row_idx) {
+                                let values = list_array.value(row_idx);
+                                let int_array = values.as_primitive::<Int64Type>();
+
+                                for i in 0..int_array.len() {
+                                    if !int_array.is_null(i) {
+                                        let value =
+                                            T::from_i64(int_array.value(i)).ok_or_else(|| {
+                                                ArrowError::InvalidArgumentError(
+                                                    "Failed to convert Int64 to target type"
+                                                        .to_string(),
+                                                )
+                                            })?;
+
+                                        sum = sum + value;
+                                        max = Some(max.map_or(value, |m| std::cmp::max(m, value)));
+                                        min = Some(min.map_or(value, |m| std::cmp::min(m, value)));
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(ArrowError::InvalidArgumentError(
+                            "List field must contain numeric values".to_string(),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(ArrowError::InvalidArgumentError(
+                        "Field must be a numeric type or a list of numeric values".to_string(),
+                    ));
+                }
+            }
+
+            // Log progress periodically
+            if batch_count % 5 == 0 {
+                println!(
+                    "Processed {} batches, {} rows so far",
+                    batch_count, total_rows
+                );
+            }
+        } // End of scope - batch gets dropped here
+
+        // Explicitly run garbage collection periodically
+        if batch_count % 50 == 0 {
+            println!("Memory cleanup after {} batches", batch_count);
+            print_memory_stats(&format!("After processing {} batches", batch_count));
+        }
+    }
+
+    println!(
+        "Processed {} batches with {} total rows",
+        batch_count, total_rows
+    );
+    println!("Found {} numeric values", count);
+
+    let process_time = process_start.elapsed();
+
+    // Update stats
+    stats.add_timing(setup_time, process_time);
+    stats = stats.finish(3); // 3 stats: sum, min, max
+    stats.print_benchmark();
+
+    Ok((
+        NumericStats {
+            sum,
+            max: max.unwrap_or_else(T::zero),
+            min: min.unwrap_or_else(T::zero),
+        },
+        stats,
+    ))
+}
+
 /// Process a column for all rows
 /// Returns the number of string values processed
 fn process_column_for_all_rows(
@@ -1734,9 +2136,10 @@ fn process_column_for_all_rows(
                                     strings_processed += 1;
 
                                     // Use entry API to avoid duplicate lookups
+                                    // Use smaller initial capacity for the vectors
                                     value_to_doc_ids
                                         .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
+                                        .or_insert_with(|| Vec::with_capacity(4))
                                         .push(global_doc_id);
                                 }
                             }
@@ -1766,7 +2169,7 @@ fn process_column_for_all_rows(
 
                                     value_to_doc_ids
                                         .entry(value)
-                                        .or_insert_with(|| Vec::with_capacity(8))
+                                        .or_insert_with(|| Vec::with_capacity(4))
                                         .push(global_doc_id);
                                 }
                             }
@@ -1791,7 +2194,7 @@ fn process_column_for_all_rows(
 
                                         value_to_doc_ids
                                             .entry(value)
-                                            .or_insert_with(|| Vec::with_capacity(8))
+                                            .or_insert_with(|| Vec::with_capacity(4))
                                             .push(global_doc_id);
                                     }
                                 }
@@ -1834,11 +2237,16 @@ fn process_column_for_all_rows(
 
                     value_to_doc_ids
                         .entry(value)
-                        .or_insert_with(|| Vec::with_capacity(8))
+                        .or_insert_with(|| Vec::with_capacity(4))
                         .push(global_doc_id);
                 }
             }
         }
+    }
+
+    // Periodically check memory usage for very large datasets
+    if strings_processed > 1_000_000 {
+        print_memory_stats("After processing 1M+ values");
     }
 
     Ok(strings_processed)
