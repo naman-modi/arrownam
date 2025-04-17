@@ -395,10 +395,14 @@ fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
         // Handle tags array
         if let Some(tags_array) = json_data["tags"].as_array() {
             for tag in tags_array {
-                let tag_str = tag.as_str().unwrap();
-                tags_builder.values().append_value(tag_str);
-                raw_string_size += tag_str.len();
-                total_strings += 1;
+                if tag.is_null() {
+                    // For null values, append a null to the string builder
+                    tags_builder.values().append_null();
+                } else if let Some(tag_str) = tag.as_str() {
+                    tags_builder.values().append_value(tag_str);
+                    raw_string_size += tag_str.len();
+                    total_strings += 1;
+                }
             }
         }
         tags_builder.append(true);
@@ -476,7 +480,8 @@ fn generate_random_json(i: usize) -> Value {
     // Create current timestamp in milliseconds
     let current_time = Utc::now().timestamp_millis();
 
-    json!({
+    // Create the base document without the tags field
+    let mut document = json!({
         "doc_id": i, // Add a document ID for efficient lookups
         "timestamp": current_time,
         "level": levels[rng.gen_range(0..levels.len())],
@@ -496,11 +501,39 @@ fn generate_random_json(i: usize) -> Value {
             }
         },
         "payload_size": rng.gen_range(100..10_240),
-        "tags": (0..rng.gen_range(1..6))
-            .map(|i| format!("tag_{}", i * rng.gen_range(1..10)))
-            .collect::<Vec<_>>(),
         "answers": answers
-    })
+    });
+
+    // Only include tags field 70% of the time
+    if rng.gen_bool(0.7) {
+        // Create an array that may include null values and duplicates
+        let mut tags: Vec<Value> = Vec::new();
+
+        let tag_count = rng.gen_range(1..6);
+        // Generate a smaller pool of possible tags
+        let possible_tags: Vec<String> = (0..rng.gen_range(1..3))
+            .map(|i| format!("tag_{}", i * rng.gen_range(1..10)))
+            .collect();
+
+        // Now sample from this pool with replacement, possibly including duplicates
+        for _ in 0..tag_count {
+            if rng.gen_bool(0.2) {
+                // 20% chance of a null value
+                tags.push(Value::Null);
+            } else {
+                // Pick a tag from our pool, allowing duplicates
+                let tag = possible_tags
+                    .choose(&mut rng)
+                    .unwrap_or(&"default_tag".to_string())
+                    .clone();
+                tags.push(Value::String(tag));
+            }
+        }
+
+        document["tags"] = Value::Array(tags);
+    }
+
+    document
 }
 
 /// Process a batch of list array values for specific document IDs using a filter bitset
@@ -1185,6 +1218,7 @@ fn main() {
         "3" => "user.id",
         "4" => "tags",
         "5" => "user.metrics.active",
+        "6" => "payload_size",
         _ => "level", // default
     };
 

@@ -6,4 +6,4 @@
 *.jsonl
 *.jsonl.gz
 *.jsonl.bz2
-Cargo.lock
+cargo.lock
