@@ -1,2 +1,8 @@
 /target
 *.arrow
+*.parquet
+*.csv
+*.json
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
