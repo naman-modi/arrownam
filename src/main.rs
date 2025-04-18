@@ -20,10 +20,13 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::File;
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+static PEAK_MEMORY_RSS: AtomicU64 = AtomicU64::new(0);
+static PEAK_MEMORY_VSZ: AtomicU64 = AtomicU64::new(0);
 
 /// Structure to hold benchmark metrics for queries
 #[derive(Debug, Clone)]
@@ -87,6 +90,10 @@ impl QueryStats {
         println!("Memory Before: {:.2} MB", self.memory_before_mb);
         println!("Memory After: {:.2} MB", self.memory_after_mb);
         println!("Memory Impact: {:.2} MB", self.memory_impact_mb);
+
+        // Add peak memory information
+        let peak_rss = PEAK_MEMORY_RSS.load(Ordering::Relaxed);
+        println!("Peak Memory: {:.2} MB", peak_rss as f64 / 1024.0 / 1024.0);
         println!("===============================");
     }
 }
@@ -114,20 +121,29 @@ where
 pub fn print_benchmark_table(all_stats: &[QueryStats]) {
     println!("\n======================= ARROW BENCHMARK SUMMARY =======================");
     println!(
-        "| {:<30} | {:<20} | {:<8} | {:<11} | {:<10} | {:<13} |",
-        "Query Type", "Field", "Doc IDs", "Result Rows", "Total Time", "Memory Impact"
+        "| {:<30} | {:<20} | {:<8} | {:<11} | {:<10} | {:<13} | {:<13} |",
+        "Query Type",
+        "Field",
+        "Doc IDs",
+        "Result Rows",
+        "Total Time",
+        "Memory Impact",
+        "Peak Memory"
     );
-    println!("|--------------------------------|----------------------|----------|-------------|------------|---------------|");
+    println!("|--------------------------------|----------------------|----------|-------------|------------|---------------|---------------|");
 
     for stat in all_stats {
+        // Get peak memory for this query type
+        let peak_rss = PEAK_MEMORY_RSS.load(Ordering::Relaxed);
         println!(
-            "| {:<30} | {:<20} | {:<8} | {:<11} | {:<8.2}s | {:<13.2} |",
+            "| {:<30} | {:<20} | {:<8} | {:<11} | {:<8.2}s | {:<13.2} | {:<13.2} |",
             stat.query_type,
             stat.field_name,
             stat.doc_ids_count,
             stat.result_rows,
             stat.total_time_ms as f64 / 1000.0,
-            stat.memory_impact_mb
+            stat.memory_impact_mb,
+            peak_rss as f64 / 1024.0 / 1024.0
         );
     }
     println!("=====================================================================");
@@ -213,6 +229,20 @@ fn get_memory_usage_stats() -> (u64, u64) {
 /// Print memory usage statistics
 fn print_memory_stats(stage: &str) {
     let (rss, vsz) = get_memory_usage_stats();
+
+    // Update peak memory values
+    let mut peak_rss = PEAK_MEMORY_RSS.load(Ordering::Relaxed);
+    if rss > peak_rss {
+        PEAK_MEMORY_RSS.store(rss, Ordering::Relaxed);
+        peak_rss = rss;
+    }
+
+    let mut peak_vsz = PEAK_MEMORY_VSZ.load(Ordering::Relaxed);
+    if vsz > peak_vsz {
+        PEAK_MEMORY_VSZ.store(vsz, Ordering::Relaxed);
+        peak_vsz = vsz;
+    }
+
     println!("\n=== Memory Stats at {} ===", stage);
     println!(
         "RSS (Physical Memory): {:.2} MB",
@@ -221,6 +251,25 @@ fn print_memory_stats(stage: &str) {
     println!(
         "VSZ (Virtual Memory): {:.2} MB",
         vsz as f64 / 1024.0 / 1024.0
+    );
+    println!("Peak RSS: {:.2} MB", peak_rss as f64 / 1024.0 / 1024.0);
+    println!("Peak VSZ: {:.2} MB", peak_vsz as f64 / 1024.0 / 1024.0);
+    println!("==============================\n");
+}
+
+/// Print peak memory usage during operation
+fn print_peak_memory_usage(operation_name: &str) {
+    let peak_rss = PEAK_MEMORY_RSS.load(Ordering::Relaxed);
+    let peak_vsz = PEAK_MEMORY_VSZ.load(Ordering::Relaxed);
+
+    println!("\n=== Peak Memory Usage During {} ===", operation_name);
+    println!(
+        "Peak RSS (Physical Memory): {:.2} MB",
+        peak_rss as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "Peak VSZ (Virtual Memory): {:.2} MB",
+        peak_vsz as f64 / 1024.0 / 1024.0
     );
     println!("==============================\n");
 }
@@ -468,7 +517,7 @@ fn create_and_write_batches(
     let mut writer = FileWriter::try_new(file, &schema).unwrap();
 
     let mut total_arrow_memory = 0;
-    let num_batches = (total_rows + batch_size - 1) / batch_size; // Ceiling division
+    let num_batches = total_rows.div_ceil(batch_size); // Ceiling division
 
     println!(
         "Creating {} record batches with {} rows each (total {} rows)",
@@ -532,15 +581,6 @@ fn create_and_write_batches(
     );
 
     Ok(total_arrow_memory)
-}
-
-/// Creates a large record batch with specified number of rows
-/// Kept for backward compatibility, but you should prefer create_and_write_batches
-fn create_large_record_batch(num_rows: usize) -> ArrowResult<RecordBatch> {
-    println!(
-        "Warning: Creating a single large batch. Consider using create_and_write_batches instead."
-    );
-    create_record_batch(0, num_rows)
 }
 
 /// Generate a random JSON document according to the specified schema
@@ -865,16 +905,6 @@ fn get_field_values_zero_copy(
     for batch_idx in 0..total_batches {
         // Create a scope to ensure batch gets dropped after processing
         {
-            // let mmap = unsafe {
-            //     Mmap::map(&file).map_err(|e| {
-            //         ArrowError::InvalidArgumentError(format!("Failed to memory map file: {}", e))
-            //     })?
-            // };
-
-            // let bytes = Bytes::from_owner(mmap);
-            // let buffer = Buffer::from(bytes);
-            // let decoder = IPCBufferDecoder::new(buffer);
-
             // Get the batch
             let batch = match decoder.get_batch(batch_idx) {
                 Ok(Some(batch)) => batch,
@@ -971,7 +1001,6 @@ fn get_field_values_by_doc_ids_zero_copy(
     let mut processed_ids = vec![false; sorted_doc_ids.len()];
     let mut processed_doc_ids = 0;
     let mut row_offset = 0;
-    let mut batch_count = 0;
 
     let setup_time = setup_start.elapsed();
 
@@ -980,6 +1009,7 @@ fn get_field_values_by_doc_ids_zero_copy(
 
     // We need to get the first batch to access its schema
     if let Ok(Some(first_batch)) = decoder.get_batch(0) {
+        let mut batch_count = 0;
         let schema = first_batch.schema();
         let field_index = schema.index_of(field_name).map_err(|_| {
             ArrowError::InvalidArgumentError(format!("Field '{}' not found in schema", field_name))
@@ -1050,22 +1080,7 @@ fn get_field_values_by_doc_ids_zero_copy(
                     break;
                 }
             } // End of scope - batch gets dropped here
-
-            // Explicitly run garbage collection periodically
-            if batch_count % 50 == 0 {
-                println!("Forcing memory cleanup after {} batches", batch_count);
-            }
         }
-
-        println!(
-            "Processed {} batches with {} total rows",
-            batch_count, row_offset
-        );
-        println!(
-            "Processed {} out of {} document IDs",
-            processed_doc_ids,
-            sorted_doc_ids.len()
-        );
 
         let process_time = process_start.elapsed();
 
@@ -1080,110 +1095,6 @@ fn get_field_values_by_doc_ids_zero_copy(
             "Failed to read the first batch to get schema".to_string(),
         ))
     }
-}
-
-/// Print a sample batch to verify schema
-fn print_sample_batch() {
-    println!("\n=== Sample Batch Content ===");
-
-    // Create a small batch with just a few records
-    match create_large_record_batch(5) {
-        Ok(batch) => {
-            let schema = batch.schema();
-
-            println!("Schema: (total {} fields)", schema.fields().len());
-            for (i, field) in schema.fields().iter().enumerate() {
-                println!("  {}. {} ({})", i, field.name(), field.data_type());
-            }
-
-            println!("\nData rows: (total {} rows)", batch.num_rows());
-            for row_idx in 0..batch.num_rows() {
-                println!("Row {}:", row_idx);
-
-                for col_idx in 0..batch.num_columns() {
-                    let field = schema.field(col_idx);
-                    let column = batch.column(col_idx);
-
-                    print!("  {}: ", field.name());
-
-                    if !column.is_null(row_idx) {
-                        match field.data_type() {
-                            DataType::Int64 => {
-                                let array = column.as_primitive::<Int64Type>();
-                                println!("{}", array.value(row_idx));
-                            }
-                            DataType::Int32 => {
-                                let array = column.as_primitive::<Int32Type>();
-                                println!("{}", array.value(row_idx));
-                            }
-                            DataType::Utf8 => {
-                                let array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                                println!("{}", array.value(row_idx));
-                            }
-                            DataType::Boolean => {
-                                let array = column.as_boolean();
-                                println!("{}", array.value(row_idx));
-                            }
-                            DataType::Timestamp(_, _) => {
-                                println!("Timestamp value (in milliseconds)");
-                            }
-                            DataType::List(field_ref) => {
-                                if let Some(list_array) =
-                                    column.as_any().downcast_ref::<GenericListArray<i32>>()
-                                {
-                                    if !list_array.is_null(row_idx) {
-                                        let values = list_array.value(row_idx);
-                                        let values_len = values.len();
-
-                                        print!("[");
-                                        match field_ref.data_type() {
-                                            DataType::Utf8 => {
-                                                if let Some(string_array) =
-                                                    values.as_any().downcast_ref::<StringArray>()
-                                                {
-                                                    for i in 0..values_len {
-                                                        if i > 0 {
-                                                            print!(", ");
-                                                        }
-                                                        print!("\"{}\"", string_array.value(i));
-                                                    }
-                                                }
-                                            }
-                                            DataType::Boolean => {
-                                                if let Some(bool_array) =
-                                                    values.as_any().downcast_ref::<BooleanArray>()
-                                                {
-                                                    for i in 0..values_len {
-                                                        if i > 0 {
-                                                            print!(", ");
-                                                        }
-                                                        print!("{}", bool_array.value(i));
-                                                    }
-                                                }
-                                            }
-                                            _ => print!("... {} items", values_len),
-                                        }
-                                        println!("]");
-                                    } else {
-                                        println!("[]");
-                                    }
-                                } else {
-                                    println!("[list values]");
-                                }
-                            }
-                            _ => println!("[unsupported type]"),
-                        }
-                    } else {
-                        println!("null");
-                    }
-                }
-                println!();
-            }
-        }
-        Err(e) => eprintln!("Error creating sample batch: {}", e),
-    }
-
-    println!("==============================\n");
 }
 
 fn main() {
@@ -1202,14 +1113,6 @@ fn main() {
 
     // Collect benchmark stats
     let mut all_benchmark_stats: Vec<QueryStats> = Vec::new();
-
-    // Ask if user wants to see a sample batch
-    println!("\nDo you want to see a sample batch? (y/n)");
-    let mut show_sample = String::new();
-    std::io::stdin().read_line(&mut show_sample).unwrap();
-    if show_sample.trim().to_lowercase() == "y" {
-        print_sample_batch();
-    }
 
     // Create a large Arrow file if it doesn't exist
     let arrow_file_path = "large_segment.arrow";
@@ -1292,6 +1195,7 @@ fn main() {
     println!("3. user.id (user identifier)");
     println!("4. tags (list of tags)");
     println!("5. user.metrics.active (boolean flag)");
+    println!("6. payload_size (size of the payload)");
 
     let mut field_choice = String::new();
     std::io::stdin().read_line(&mut field_choice).unwrap();
@@ -1314,15 +1218,16 @@ fn main() {
     println!("1. Process all documents with zero-copy IPC (most memory efficient)");
     println!("2. Process specific document IDs with zero-copy IPC");
     println!("3. Calculate numeric statistics with zero-copy IPC");
+    println!("4. Calculate numeric statistics for 100 random document IDs with zero-copy IPC");
 
     let mut choice = String::new();
     std::io::stdin().read_line(&mut choice).unwrap();
     let choice = choice.trim();
 
     let tests_to_run = if choice.to_lowercase() == "all" {
-        (1..=3).collect::<Vec<_>>()
+        (1..=4).collect::<Vec<_>>()
     } else if let Ok(test_num) = choice.parse::<i32>() {
-        if (1..=3).contains(&test_num) {
+        if (1..=4).contains(&test_num) {
             vec![test_num]
         } else {
             vec![1] // Default to zero-copy test
@@ -1332,6 +1237,10 @@ fn main() {
     };
 
     for test in &tests_to_run {
+        // Reset peak memory at the start of each test
+        PEAK_MEMORY_RSS.store(0, Ordering::Relaxed);
+        PEAK_MEMORY_VSZ.store(0, Ordering::Relaxed);
+
         match test {
             1 => {
                 // Process all documents using zero-copy IPC
@@ -1366,6 +1275,9 @@ fn main() {
 
                         // Add benchmark stats
                         all_benchmark_stats.push(stats);
+
+                        // Print peak memory for this operation
+                        print_peak_memory_usage("Zero-Copy Processing (All Documents)");
                     }
                     Err(e) => eprintln!("Error processing with zero-copy: {}", e),
                 }
@@ -1414,6 +1326,9 @@ fn main() {
 
                         // Add benchmark stats
                         all_benchmark_stats.push(stats);
+
+                        // Add after the successful operation:
+                        print_peak_memory_usage("Zero-Copy Processing (Specific Document IDs)");
                     }
                     Err(e) => eprintln!("Error processing with zero-copy: {}", e),
                 }
@@ -1460,17 +1375,32 @@ fn main() {
 
                         // Add benchmark stats
                         all_benchmark_stats.push(query_stats);
+
+                        // Add after successful operations in test 3:
+                        print_peak_memory_usage("Zero-Copy Numeric Stats Processing");
                     }
                     Err(e) => eprintln!("Error calculating numeric stats: {}", e),
                 }
 
                 print_memory_stats("After processing");
+            }
+            4 => {
+                // This test is for numeric statistics with 100 random document IDs
+                let numeric_field_name = if field_name != "user.metrics.login_time_ms"
+                    && field_name != "user.metrics.clicks"
+                    && field_name != "payload_size"
+                {
+                    println!("\nTest 4 requires a numeric field. Please choose user.metrics.login_time_ms, user.metrics.clicks, or payload_size.");
+                    println!("Using payload_size for this test.");
+                    "payload_size"
+                } else {
+                    field_name
+                };
 
-                // Now test with specific document IDs for comparison
-                // Generate random document IDs
+                // Generate 100 random document IDs
                 let mut rng = thread_rng();
                 let total_docs = num_rows; // Total number of documents to select from
-                let num_docs = 1000; // Number of documents to process (increased for better measurement)
+                let num_docs = 100; // Number of documents to process
                 let mut doc_ids: Vec<usize> = (0..total_docs).collect();
                 doc_ids.shuffle(&mut rng);
                 let doc_ids = doc_ids[..num_docs].to_vec();
@@ -1482,7 +1412,7 @@ fn main() {
 
                 // Calculate numeric stats using zero-copy approach for specific doc IDs
                 println!(
-                    "\n=== Zero-Copy IPC Numeric Stats Processing (Specific Document IDs) ==="
+                    "\n=== Zero-Copy IPC Numeric Stats Processing (100 Random Document IDs) ==="
                 );
                 print_memory_stats("Before processing");
 
@@ -1513,13 +1443,16 @@ fn main() {
 
                         // Create and add benchmark stats
                         let mut query_stats = QueryStats::new(
-                            "get_numeric_stats_by_doc_ids_zero_copy",
+                            "get_numeric_stats_for_100_random_docs",
                             numeric_field_name,
                             num_docs,
                         );
                         query_stats.add_timing(Duration::from_secs(0), elapsed);
                         query_stats = query_stats.finish(3); // 3 stats: sum, min, max
                         all_benchmark_stats.push(query_stats);
+
+                        // Print peak memory usage
+                        print_peak_memory_usage("Numeric Stats for 100 Random Document IDs");
                     }
                     Err(e) => eprintln!("Error calculating numeric stats: {}", e),
                 }
@@ -1865,7 +1798,7 @@ where
 
     // Use the zero-copy approach
     // We need to copy from the mmap to handle lifetime issues
-    let bytes = Bytes::copy_from_slice(&mmap[..]);
+    let bytes = Bytes::from_owner(mmap);
     // Create Buffer from Bytes (zero-copy)
     let buffer = Buffer::from(bytes);
 
@@ -2242,11 +2175,6 @@ fn process_column_for_all_rows(
                 }
             }
         }
-    }
-
-    // Periodically check memory usage for very large datasets
-    if strings_processed > 1_000_000 {
-        print_memory_stats("After processing 1M+ values");
     }
 
     Ok(strings_processed)

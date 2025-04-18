@@ -14,11 +14,16 @@ A high-performance log data processing system built with Rust and Apache Arrow f
 
 The system demonstrates excellent performance across various query types:
 
-| Query Type                     | Field                | Doc IDs  | Result Rows | Total Time | Memory Impact |
+
+| Query Type                     | Field                | Doc IDs  | Result Rows | Total Time | Peak Memory Impact (in MB)  |
 |--------------------------------|----------------------|----------|-------------|------------|---------------|
-| get_field_values_zero_copy     | level                | -        | 4           | 2.99    s | 5609.55       |
-| get_field_values_by_doc_ids_zero_copy | level                | 100      | 4           | 1.53    s | 6083.47       |
-| get_numeric_stats_by_doc_ids_zero_copy | payload_size         | 1000     | 3           | 1.16    s | 0.00          |
+| get_field_values_zero_copy     | tags                 | 10M        | 10          | 3.98    s | 542.06       |
+| get_field_values_by_doc_ids_zero_copy | level                | 100      | 4           | 1.03    s |  84.00         |
+| get_field_values_zero_copy     | source.region        | 10M        | 3           | 0.61    s |  84.95         |
+| get_numeric_stats_zero_copy    | payload_size         | 10M        | 3           | 0.80    s | 135.75          |
+| get_numeric_stats_for_100_random_docs | payload_size         | 100      | 3           | 0.29    s | 80.00         |
+| get_field_values_zero_copy     | tags (2nd time)               | 10M        | 10          | 1.24    s | 138.27        |
+
 
 
 ## Query API
